@@ -11,7 +11,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "cjs")]
 mod cjs_parse;
-mod comments;
 #[cfg(feature = "dep_analysis")]
 pub mod dep;
 pub mod diagnostics;
@@ -32,7 +31,6 @@ mod types;
 
 #[cfg(feature = "cjs")]
 pub use cjs_parse::*;
-pub use comments::*;
 pub use deno_media_type::*;
 #[cfg(feature = "emit")]
 pub use emit::*;

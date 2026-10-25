@@ -74,7 +74,6 @@ To upgrade oxc:
 1. Ensure they all have `upstream` remotes set for the urls specified above. For
    example, your `deno_graph` repo should have
    `git remote add upstream https://github.com/denoland/deno_graph`.
-1. Run `./scripts/update_oxc_deps.ts`
 1. Run `./scripts/01_setup.ts`
 1. Run `./scripts/02_build.ts` and fix any build errors.
 1. Run `./scripts/03_test.ts` and fix any failing tests.

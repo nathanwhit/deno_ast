@@ -123,6 +123,31 @@ fn parse<'a>(
     ));
   }
 
+  // When the lexer hits a character it cannot lex (e.g. a Markdown file),
+  // oxc stops parsing, reports the lexer error as a regular diagnostic and
+  // leaves `fatal_error` unset, returning whatever was parsed so far. Treat an
+  // incomplete parse as a parse error, like swc did.
+  if !ret.diagnostics.is_empty()
+    && let Some(unparsed_start) =
+      unparsed_source_start(&ret.program, source_in_arena)
+  {
+    let source_text_info = SourceTextInfo::new(source.clone());
+    let mut diagnostics = ret.diagnostics.into_iter().collect::<Vec<_>>();
+    let index = diagnostics
+      .iter()
+      .position(|d| {
+        d.labels
+          .iter()
+          .any(|label| label.offset() >= unparsed_start)
+      })
+      .unwrap_or(0);
+    return Err(ParseDiagnostic::from_oxc_diagnostic(
+      diagnostics.swap_remove(index),
+      &specifier,
+      source_text_info,
+    ));
+  }
+
   // A script (e.g. a CommonJS module) cannot use `import`/`export` statements.
   // OXC parses these without erroring but records `has_module_syntax`, so
   // surface the error here rather than silently accepting the module syntax.
@@ -182,6 +207,32 @@ fn parse<'a>(
     diagnostics,
     scoping,
   })
+}
+
+/// Returns the offset of the first non-whitespace character after everything
+/// the parser consumed (statements, directives, the hashbang and comments), or
+/// `None` when the whole source was parsed. A successful parse covers the
+/// whole source, so trailing non-trivia means the parser stopped early.
+fn unparsed_source_start(
+  program: &oxc::ast::ast::Program,
+  source: &str,
+) -> Option<u32> {
+  use oxc::span::GetSpan;
+  let parsed_end = program
+    .body
+    .last()
+    .map(|stmt| stmt.span().end)
+    .into_iter()
+    .chain(program.directives.last().map(|d| d.span.end))
+    .chain(program.hashbang.as_ref().map(|h| h.span.end))
+    .chain(program.comments.last().map(|c| c.span.end))
+    .max()
+    .unwrap_or(0);
+  let rest = source.get(parsed_end as usize..)?;
+  rest
+    .char_indices()
+    .find(|(_, c)| !c.is_whitespace() && *c != '\u{FEFF}')
+    .map(|(i, _)| parsed_end + i as u32)
 }
 
 /// Finds the span of the first `import`/`export` statement in a program, used
@@ -269,6 +320,53 @@ mod test {
     assert_eq!(program.body().len(), 1);
     assert_eq!(program.get_leading_comments().count(), 1);
     assert_eq!(program.comments().len(), 2);
+  }
+
+  #[test]
+  fn should_error_when_lexer_stops_early() {
+    // oxc's lexer stops at a character it cannot lex without flagging a
+    // fatal error; the result must still be a parse error like swc produced.
+    for (text, expected_line) in [
+      ("# Some Markdown\n\n**bold**", 1),
+      ("const a = 1;\n# not js\nconst b = 2;", 2),
+      ("const a = 1;\n@", 2),
+    ] {
+      let allocator = Allocator::default();
+      let err = parse_module(
+        &allocator,
+        ParseParams {
+          specifier: ModuleSpecifier::parse("file:///my_file.js").unwrap(),
+          text: text.into(),
+          media_type: MediaType::JavaScript,
+          capture_tokens: false,
+          maybe_source_type: None,
+          scope_analysis: false,
+        },
+      )
+      .err()
+      .unwrap_or_else(|| panic!("expected a parse error for {text:?}"));
+      assert_eq!(
+        err.display_position().line_number,
+        expected_line,
+        "{text:?}"
+      );
+    }
+
+    // trailing comments and whitespace after the last statement are fine
+    let allocator = Allocator::default();
+    let program = parse_module(
+      &allocator,
+      ParseParams {
+        specifier: ModuleSpecifier::parse("file:///my_file.js").unwrap(),
+        text: "const a;\n// trailing\n\n".into(),
+        media_type: MediaType::JavaScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    assert_eq!(program.diagnostics().len(), 1);
   }
 
   #[test]
