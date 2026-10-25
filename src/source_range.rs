@@ -85,14 +85,28 @@ impl SourceTextInfo {
     &self.text[start..end]
   }
 
-  /// Get 1-indexed line and column display for a byte position.
+  /// Get 1-indexed line and column display for a byte position, counting a
+  /// tab as 4 columns.
   pub fn line_and_column_display(
     &self,
     byte_pos: usize,
   ) -> LineAndColumnDisplay {
+    self.line_and_column_display_with_indent_width(byte_pos, 4)
+  }
+
+  /// Get 1-indexed line and column display for a byte position, counting a
+  /// tab as `indent_width` columns and every other character as one.
+  pub fn line_and_column_display_with_indent_width(
+    &self,
+    byte_pos: usize,
+    indent_width: usize,
+  ) -> LineAndColumnDisplay {
     let line_index = self.line_index(byte_pos);
     let line_start = self.line_start(line_index);
-    let column = self.text[line_start..byte_pos].encode_utf16().count();
+    let column = self.text[line_start..byte_pos]
+      .chars()
+      .map(|c| if c == '\t' { indent_width } else { 1 })
+      .sum::<usize>();
     LineAndColumnDisplay {
       line_number: line_index + 1,
       column_number: column + 1,
@@ -105,4 +119,29 @@ impl SourceTextInfo {
 pub struct LineAndColumnDisplay {
   pub line_number: usize,
   pub column_number: usize,
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+
+  #[test]
+  fn line_and_column_display_tabs() {
+    let info = SourceTextInfo::from_string("a\n\t\tb".to_string());
+    let pos = info.text_str().find('b').unwrap();
+    assert_eq!(
+      info.line_and_column_display(pos),
+      LineAndColumnDisplay {
+        line_number: 2,
+        column_number: 9,
+      }
+    );
+    assert_eq!(
+      info.line_and_column_display_with_indent_width(pos, 2),
+      LineAndColumnDisplay {
+        line_number: 2,
+        column_number: 5,
+      }
+    );
+  }
 }
