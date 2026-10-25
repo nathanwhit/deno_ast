@@ -7,6 +7,7 @@ use oxc::ast::ast::*;
 use oxc::ast_visit::Visit;
 use oxc::ast_visit::walk;
 
+use crate::JSStrExt;
 use crate::ParsedSource;
 
 pub type CjsAnalysis = crate::ModuleExportsAndReExports;
@@ -86,11 +87,11 @@ impl CjsVisitor {
     }
     match &args[1] {
       Argument::StringLiteral(str_lit) => {
-        let lit_value = str_lit.value.as_str();
+        let lit_value = str_lit.value.to_str_lossy();
         if is_valid_object_define_obj_lit(&args[2]) {
-          self.add_export(lit_value);
+          self.add_export(&lit_value);
         } else {
-          self.add_unsafe_getter(lit_value);
+          self.add_unsafe_getter(&lit_value);
         }
       }
       Argument::Identifier(ident) => {
@@ -267,7 +268,7 @@ fn get_call_expr_require_value<'a>(
     "require" => {
       let arg = call_expr.arguments.first()?;
       if let Argument::StringLiteral(str_lit) = arg {
-        return Some(str_lit.value.as_str());
+        return str_lit.value.as_str();
       }
     }
     "_interopRequireWildcard" => {
@@ -312,7 +313,7 @@ fn get_member_expr_prop_text(member: &MemberExpression) -> Option<String> {
     }
     MemberExpression::ComputedMemberExpression(computed) => {
       if let Expression::StringLiteral(str_lit) = &computed.expression {
-        Some(str_lit.value.to_string())
+        Some(str_lit.value.to_string_lossy())
       } else {
         None
       }
@@ -518,19 +519,12 @@ fn is_supported_get_prop(prop: &ObjectProperty) -> bool {
         .as_ref()
         .map(|b| is_non_side_effect_block_stmt(b))
         .unwrap_or(false),
-      Expression::ArrowFunctionExpression(arrow) => {
-        if arrow.expression {
-          if let Statement::ExpressionStatement(expr_stmt) =
-            &arrow.body.statements[0]
-          {
-            is_non_side_effect_expr(&expr_stmt.expression)
-          } else {
-            false
-          }
-        } else {
-          is_non_side_effect_block_stmt(&arrow.body)
+      Expression::ArrowFunctionExpression(arrow) => match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => {
+          is_non_side_effect_block_stmt(body)
         }
-      }
+        body => body.as_expression().is_some_and(is_non_side_effect_expr),
+      },
       _ => false,
     }
   }
@@ -553,19 +547,12 @@ fn get_prop_return_expr<'a>(
         .body
         .as_ref()
         .and_then(|b| get_block_stmt_return_expr(b)),
-      Expression::ArrowFunctionExpression(arrow) => {
-        if arrow.expression {
-          if let Statement::ExpressionStatement(expr_stmt) =
-            &arrow.body.statements[0]
-          {
-            Some(&expr_stmt.expression)
-          } else {
-            None
-          }
-        } else {
-          get_block_stmt_return_expr(&arrow.body)
+      Expression::ArrowFunctionExpression(arrow) => match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => {
+          get_block_stmt_return_expr(body)
         }
-      }
+        body => body.as_expression(),
+      },
       _ => None,
     }
   }
@@ -620,7 +607,9 @@ fn is_non_side_effect_member_prop(member: &MemberExpression) -> bool {
 fn get_property_key_name(key: &PropertyKey) -> Option<String> {
   match key {
     PropertyKey::StaticIdentifier(ident) => Some(ident.name.to_string()),
-    PropertyKey::StringLiteral(str_lit) => Some(str_lit.value.to_string()),
+    PropertyKey::StringLiteral(str_lit) => {
+      Some(str_lit.value.to_string_lossy())
+    }
     _ => None,
   }
 }

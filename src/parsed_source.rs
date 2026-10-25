@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use oxc::ast::ast::Program;
 use oxc::ast::ast::Statement;
 use oxc::span::Span;
+use oxc::syntax::module_record::ModuleRecord;
 
 use crate::MediaType;
 use crate::ModuleSpecifier;
@@ -81,6 +82,7 @@ pub struct ParsedSource<'a> {
   pub(crate) text: Arc<str>,
   pub(crate) source_text_info: OnceLock<SourceTextInfo>,
   pub(crate) program: Program<'a>,
+  pub(crate) module_record: ModuleRecord<'a>,
   pub(crate) tokens: oxc::allocator::Vec<'a, oxc::parser::Token>,
   pub(crate) diagnostics: ParseDiagnostics,
   /// Scope/symbol information, populated when parsing with
@@ -118,6 +120,12 @@ impl<'a> ParsedSource<'a> {
   /// Gets the parsed program.
   pub fn program(&self) -> &Program<'a> {
     &self.program
+  }
+
+  /// Gets the ES module record (imports, exports, requested modules, etc.)
+  /// collected by the parser.
+  pub fn module_record(&self) -> &ModuleRecord<'a> {
+    &self.module_record
   }
 
   /// Gets the scope/symbol information, if the source was parsed with
@@ -220,7 +228,9 @@ fn compute_is_script_from_body(body: &[Statement<'_>]) -> bool {
   for stmt in body {
     match stmt {
       Statement::ImportDeclaration(_)
+      | Statement::ExportDeclaration(_)
       | Statement::ExportNamedDeclaration(_)
+      | Statement::ExportFromDeclaration(_)
       | Statement::ExportDefaultDeclaration(_)
       | Statement::ExportAllDeclaration(_) => return false,
       Statement::TSImportEqualsDeclaration(_)

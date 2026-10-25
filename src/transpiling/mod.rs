@@ -223,9 +223,18 @@ impl<'a> ParsedSource<'a> {
     &mut self,
     allocator: &'a Allocator,
     transpile_options: &TranspileOptions,
-    _transpile_module_options: &TranspileModuleOptions,
+    transpile_module_options: &TranspileModuleOptions,
     emit_options: &EmitOptions,
   ) -> Result<EmittedSourceText, TranspileError> {
+    let module_kind = transpile_module_options.module_kind.unwrap_or({
+      if matches!(self.media_type, MediaType::Cjs | MediaType::Cts) {
+        ModuleKind::Cjs
+      } else {
+        ModuleKind::Esm
+      }
+    });
+    ensure_no_fatal_diagnostics(self.diagnostics.for_module_kind(module_kind))?;
+
     let transpile_options =
       resolve_transpile_options(self.media_type, transpile_options);
 
@@ -293,8 +302,9 @@ impl<'a> ParsedSource<'a> {
       Path::new(self.specifier.as_str()),
       &transform_options,
     );
-    let _transform_ret =
+    let transform_ret =
       transformer.build_with_scoping(scoping, &mut self.program);
+    ensure_no_transform_errors(&transform_ret.diagnostics)?;
 
     // Apply custom post-transforms: transform any import declarations
     // inserted by the JSX transform to variable declarations
@@ -503,12 +513,19 @@ pub fn transform_program<'a>(
   );
   let transform_ret = transformer.build_with_scoping(scoping, program);
 
-  if !transform_ret.errors.is_empty() {
+  ensure_no_transform_errors(&transform_ret.diagnostics)?;
+
+  Ok(())
+}
+
+fn ensure_no_transform_errors(
+  diagnostics: &oxc::diagnostics::Diagnostics,
+) -> Result<(), TransformProgramError> {
+  if diagnostics.has_errors() {
     let messages: Vec<String> =
-      transform_ret.errors.iter().map(|e| e.to_string()).collect();
+      diagnostics.errors().map(|e| e.to_string()).collect();
     return Err(TransformProgramError::Transform(messages.join("\n")));
   }
-
   Ok(())
 }
 

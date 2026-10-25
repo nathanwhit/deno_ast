@@ -111,11 +111,8 @@ impl ParseDiagnostic {
   ) -> ParseDiagnostic {
     let span = err
       .labels
-      .as_ref()
-      .and_then(|labels| labels.first())
-      .map(|label| {
-        Span::new(label.offset() as u32, (label.offset() + label.len()) as u32)
-      })
+      .first()
+      .map(|label| Span::new(label.offset(), label.offset() + label.len()))
       .unwrap_or(Span::new(0, 0));
 
     ParseDiagnostic(Box::new(ParseDiagnosticInner {

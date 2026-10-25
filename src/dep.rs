@@ -7,7 +7,8 @@ use oxc::ast::ast::CallExpression;
 use oxc::ast::ast::Comment;
 use oxc::ast::ast::Declaration;
 use oxc::ast::ast::ExportAllDeclaration;
-use oxc::ast::ast::ExportNamedDeclaration;
+use oxc::ast::ast::ExportDeclaration;
+use oxc::ast::ast::ExportFromDeclaration;
 use oxc::ast::ast::Expression;
 use oxc::ast::ast::ImportDeclaration;
 use oxc::ast::ast::ImportExpression;
@@ -17,7 +18,6 @@ use oxc::ast::ast::ObjectPropertyKind;
 use oxc::ast::ast::Program;
 use oxc::ast::ast::PropertyKey;
 use oxc::ast::ast::PropertyKind;
-use oxc::ast::ast::Statement;
 use oxc::ast::ast::TSImportEqualsDeclaration;
 use oxc::ast::ast::TSImportType;
 use oxc::ast::ast::TSModuleReference;
@@ -30,6 +30,7 @@ use oxc::span::Span;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::JSStrExt;
 use crate::ParsedSource;
 
 impl ParsedSource<'_> {
@@ -231,7 +232,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
   fn handle_import_expression(&mut self, node: &ImportExpression<'a>) {
     let (argument, argument_span) = match &node.source {
       Expression::StringLiteral(s) => {
-        (DynamicArgument::String(s.value.to_string()), s.span)
+        (DynamicArgument::String(s.value.to_string_lossy()), s.span)
       }
       Expression::TemplateLiteral(tpl) => {
         let (arg, span) = self.analyze_template_literal(tpl);
@@ -273,7 +274,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
         .value
         .cooked
         .as_ref()
-        .map(|s| s.to_string())
+        .map(|s| s.to_string_lossy())
         .unwrap_or_default();
       (DynamicArgument::String(cooked), span)
     } else {
@@ -283,7 +284,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
         if let Some(cooked) = &tpl.quasis[i].value.cooked
           && !cooked.is_empty()
         {
-          parts.push(DynamicTemplatePart::String(cooked.to_string()));
+          parts.push(DynamicTemplatePart::String(cooked.to_string_lossy()));
         }
         if tpl.expressions.get(i).is_some() {
           parts.push(DynamicTemplatePart::Expr);
@@ -311,7 +312,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
           visit_bin(parts, left)?;
         }
         Expression::StringLiteral(s) => {
-          parts.push(DynamicTemplatePart::String(s.value.to_string()));
+          parts.push(DynamicTemplatePart::String(s.value.to_string_lossy()));
         }
         _ => {
           if parts.is_empty() {
@@ -322,7 +323,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
       };
 
       if let Expression::StringLiteral(s) = &bin.right {
-        parts.push(DynamicTemplatePart::String(s.value.to_string()));
+        parts.push(DynamicTemplatePart::String(s.value.to_string_lossy()));
       } else {
         parts.push(DynamicTemplatePart::Expr);
       }
@@ -340,7 +341,7 @@ impl<'a, 'b> DependencyCollector<'a, 'b> {
 
 impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
   fn visit_import_declaration(&mut self, node: &ImportDeclaration<'a>) {
-    let specifier = node.source.value.to_string();
+    let specifier = node.source.value.to_string_lossy();
     let leading_comments = self.get_leading_comments(node.span.start);
     let kind = if node.import_kind == ImportOrExportKind::Type {
       StaticDependencyKind::ImportType
@@ -360,48 +361,45 @@ impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
     );
   }
 
-  fn visit_export_named_declaration(
-    &mut self,
-    node: &ExportNamedDeclaration<'a>,
-  ) {
+  fn visit_export_declaration(&mut self, node: &ExportDeclaration<'a>) {
     // Handle `export import foo = require(...)` - OXC wraps this as
-    // ExportNamedDeclaration with declaration = TSImportEqualsDeclaration
-    if let Some(Declaration::TSImportEqualsDeclaration(import_eq)) =
-      &node.declaration
+    // ExportDeclaration with declaration = TSImportEqualsDeclaration
+    if let Declaration::TSImportEqualsDeclaration(import_eq) = &node.declaration
     {
       self.handle_export_import_equals(node.span, import_eq);
       return;
     }
 
-    if let Some(src) = &node.source {
-      let specifier = src.value.to_string();
-      let leading_comments = self.get_leading_comments(node.span.start);
-      let kind = if node.export_kind == ImportOrExportKind::Type {
-        StaticDependencyKind::ExportType
-      } else {
-        StaticDependencyKind::Export
-      };
-      self.items.push(
-        StaticDependencyDescriptor {
-          kind,
-          leading_comments,
-          span: node.span,
-          specifier,
-          specifier_span: src.span,
-          import_attributes: parse_import_attributes(
-            node.with_clause.as_deref(),
-          ),
-        }
-        .into(),
-      );
-    }
-
     // Walk children to find TSImportType nodes in type annotations
-    walk::walk_export_named_declaration(self, node);
+    walk::walk_export_declaration(self, node);
+  }
+
+  fn visit_export_from_declaration(
+    &mut self,
+    node: &ExportFromDeclaration<'a>,
+  ) {
+    let specifier = node.source.value.to_string_lossy();
+    let leading_comments = self.get_leading_comments(node.span.start);
+    let kind = if node.export_kind == ImportOrExportKind::Type {
+      StaticDependencyKind::ExportType
+    } else {
+      StaticDependencyKind::Export
+    };
+    self.items.push(
+      StaticDependencyDescriptor {
+        kind,
+        leading_comments,
+        span: node.span,
+        specifier,
+        specifier_span: node.source.span,
+        import_attributes: parse_import_attributes(node.with_clause.as_deref()),
+      }
+      .into(),
+    );
   }
 
   fn visit_export_all_declaration(&mut self, node: &ExportAllDeclaration<'a>) {
-    let specifier = node.source.value.to_string();
+    let specifier = node.source.value.to_string_lossy();
     let leading_comments = self.get_leading_comments(node.span.start);
     let kind = if node.export_kind == ImportOrExportKind::Type {
       StaticDependencyKind::ExportType
@@ -422,7 +420,7 @@ impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
   }
 
   fn visit_ts_import_type(&mut self, node: &TSImportType<'a>) {
-    let specifier = node.source.value.to_string();
+    let specifier = node.source.value.to_string_lossy();
     let leading_comments = self.get_leading_comments(node.span.start);
     self.items.push(
       StaticDependencyDescriptor {
@@ -442,13 +440,6 @@ impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
     walk::walk_ts_import_type(self, node);
   }
 
-  fn visit_statements(
-    &mut self,
-    stmts: &oxc::allocator::Vec<'a, Statement<'a>>,
-  ) {
-    walk::walk_statements(self, stmts);
-  }
-
   fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
     walk::walk_call_expression(self, node);
 
@@ -466,7 +457,7 @@ impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
 
     let (argument, argument_span) = match arg_expr {
       Expression::StringLiteral(s) => {
-        (DynamicArgument::String(s.value.to_string()), s.span)
+        (DynamicArgument::String(s.value.to_string_lossy()), s.span)
       }
       Expression::TemplateLiteral(tpl) => self.analyze_template_literal(tpl),
       Expression::BinaryExpression(bin) => {
@@ -502,7 +493,7 @@ impl<'a> Visit<'a> for DependencyCollector<'a, '_> {
     {
       let leading_comments = self.get_leading_comments(node.span.start);
       let expr = &module.expression;
-      let specifier = expr.value.to_string();
+      let specifier = expr.value.to_string_lossy();
 
       let kind = if node.import_kind == ImportOrExportKind::Type {
         StaticDependencyKind::ImportType
@@ -536,7 +527,7 @@ impl DependencyCollector<'_, '_> {
     {
       let leading_comments = self.get_leading_comments(export_span.start);
       let expr = &module.expression;
-      let specifier = expr.value.to_string();
+      let specifier = expr.value.to_string_lossy();
 
       let kind = if node.import_kind == ImportOrExportKind::Type {
         StaticDependencyKind::ImportType
@@ -573,11 +564,13 @@ fn parse_import_attributes(
         ident.name.to_string()
       }
       oxc::ast::ast::ImportAttributeKey::StringLiteral(s) => {
-        s.value.to_string()
+        s.value.to_string_lossy()
       }
     };
-    import_attributes
-      .insert(key, ImportAttribute::Known(attr.value.value.to_string()));
+    import_attributes.insert(
+      key,
+      ImportAttribute::Known(attr.value.value.to_string_lossy()),
+    );
   }
   ImportAttributes::Known(import_attributes)
 }
@@ -603,7 +596,7 @@ fn parse_dynamic_import_attributes_from_expr(
       return ImportAttributes::Unknown;
     }
     let key = match &prop.key {
-      PropertyKey::StringLiteral(s) => s.value.to_string(),
+      PropertyKey::StringLiteral(s) => s.value.to_string_lossy(),
       PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
       _ => return ImportAttributes::Unknown,
     };
@@ -643,7 +636,7 @@ fn parse_import_attributes_from_options_object(
       _ => return ImportAttributes::Unknown,
     };
     let key = match &prop.key {
-      PropertyKey::StringLiteral(s) => s.value.to_string(),
+      PropertyKey::StringLiteral(s) => s.value.to_string_lossy(),
       PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
       _ => continue,
     };
@@ -673,13 +666,13 @@ fn parse_import_attributes_from_object_lit(
       return ImportAttributes::Unknown;
     }
     let key = match &prop.key {
-      PropertyKey::StringLiteral(s) => s.value.to_string(),
+      PropertyKey::StringLiteral(s) => s.value.to_string_lossy(),
       PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
       _ => return ImportAttributes::Unknown,
     };
     if let Expression::StringLiteral(str_) = &prop.value {
       attributes_map
-        .insert(key, ImportAttribute::Known(str_.value.to_string()));
+        .insert(key, ImportAttribute::Known(str_.value.to_string_lossy()));
     } else {
       attributes_map.insert(key, ImportAttribute::Unknown);
     }

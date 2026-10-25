@@ -106,9 +106,9 @@ fn parse<'a>(
   };
 
   // Check for fatal parse errors
-  if ret.panicked {
+  if ret.fatal_error {
     let source_text_info = SourceTextInfo::new(source.clone());
-    if let Some(error) = ret.errors.into_iter().next() {
+    if let Some(error) = ret.diagnostics.into_iter().next() {
       return Err(ParseDiagnostic::from_oxc_diagnostic(
         error,
         &specifier,
@@ -139,12 +139,12 @@ fn parse<'a>(
   }
 
   // Collect non-fatal diagnostics
-  let diagnostics = if ret.errors.is_empty() {
+  let diagnostics = if ret.diagnostics.is_empty() {
     ParseDiagnostics::default()
   } else {
     let source_text_info = SourceTextInfo::new(source.clone());
     let diags = ret
-      .errors
+      .diagnostics
       .into_iter()
       .map(|err| {
         ParseDiagnostic::from_oxc_diagnostic(
@@ -177,6 +177,7 @@ fn parse<'a>(
     text: source,
     source_text_info: Default::default(),
     program: ret.program,
+    module_record: ret.module_record,
     tokens: ret.tokens,
     diagnostics,
     scoping,
@@ -188,16 +189,11 @@ fn parse<'a>(
 fn first_module_decl_span(
   program: &oxc::ast::ast::Program,
 ) -> Option<oxc::span::Span> {
-  use oxc::ast::ast::Statement;
-  program.body.iter().find_map(|stmt| match stmt {
-    Statement::ImportDeclaration(d) => Some(d.span),
-    Statement::ExportAllDeclaration(d) => Some(d.span),
-    Statement::ExportDefaultDeclaration(d) => Some(d.span),
-    Statement::ExportNamedDeclaration(d) => Some(d.span),
-    Statement::TSExportAssignment(d) => Some(d.span),
-    Statement::TSNamespaceExportDeclaration(d) => Some(d.span),
-    _ => None,
-  })
+  use oxc::span::GetSpan;
+  program
+    .body
+    .iter()
+    .find_map(|stmt| stmt.as_module_declaration().map(GetSpan::span))
 }
 
 /// Gets the default `SourceType` used by `deno_ast` for the provided media type.

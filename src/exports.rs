@@ -1,9 +1,9 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
+use oxc::syntax::module_record::ExportEntry;
+use oxc::syntax::module_record::ExportExportName;
 use serde::Deserialize;
 use serde::Serialize;
-
-use oxc::ast::ast::*;
 
 use crate::ParsedSource;
 
@@ -15,91 +15,49 @@ pub struct ModuleExportsAndReExports {
 
 impl ParsedSource<'_> {
   /// Analyzes the ES runtime exports for require ESM.
+  ///
+  /// This is used during CJS export analysis when a CJS module
+  /// re-exports an ESM module and the original CJS module needs
+  /// to know the exports of the ESM module so it can create its
+  /// wrapper ESM module.
   pub fn analyze_es_runtime_exports(&self) -> ModuleExportsAndReExports {
+    let module_record = self.module_record();
     let mut result = ModuleExportsAndReExports::default();
 
-    for stmt in &self.program.body {
-      match stmt {
-        Statement::ImportDeclaration(_) => {}
-        Statement::ExportAllDeclaration(n) => {
-          if let Some(exported) = &n.exported {
-            // `export * as y from './other.js'` is a named export
-            result.exports.push(exported.name().to_string());
-          } else {
-            result.reexports.push(n.source.value.to_string());
-          }
+    // Type-only exports (`export type { A }`, `export interface B {}`,
+    // `export declare const c`) do not exist at runtime.
+    let mut entries: Vec<&ExportEntry<'_>> = module_record
+      .local_export_entries
+      .iter()
+      .chain(module_record.indirect_export_entries.iter())
+      .filter(|entry| !entry.is_type)
+      .collect();
+    // The module record groups entries by kind, so sort them back into
+    // source order.
+    entries.sort_by_key(|entry| entry.statement_span.start);
+    for entry in entries {
+      match &entry.export_name {
+        ExportExportName::Name(name) => {
+          result.exports.push(name.name.to_string());
         }
-        Statement::ExportNamedDeclaration(n) => {
-          if let Some(decl) = &n.declaration {
-            collect_declaration_exports(decl, &mut result.exports);
-          }
-          for s in &n.specifiers {
-            result.exports.push(s.exported.name().to_string());
-          }
-        }
-        Statement::ExportDefaultDeclaration(_) => {
+        ExportExportName::Default(_) => {
           result.exports.push("default".to_string());
         }
-        Statement::TSImportEqualsDeclaration(_)
-        | Statement::TSExportAssignment(_) => {
-          // ignore because it's cjs
-        }
-        _ => {}
+        ExportExportName::Null => {}
+      }
+    }
+
+    for entry in &module_record.star_export_entries {
+      if entry.is_type {
+        continue;
+      }
+      if let Some(module_request) = &entry.module_request {
+        result.reexports.push(module_request.name.to_string());
       }
     }
 
     result
   }
-}
-
-fn collect_declaration_exports(decl: &Declaration, exports: &mut Vec<String>) {
-  match decl {
-    Declaration::ClassDeclaration(d) => {
-      if let Some(id) = &d.id {
-        exports.push(id.name.to_string());
-      }
-    }
-    Declaration::FunctionDeclaration(d) => {
-      if let Some(id) = &d.id {
-        exports.push(id.name.to_string());
-      }
-    }
-    Declaration::VariableDeclaration(d) => {
-      for decl in &d.declarations {
-        collect_binding_pattern_names(&decl.id, exports);
-      }
-    }
-    Declaration::TSEnumDeclaration(d) => {
-      exports.push(d.id.name.to_string());
-    }
-    Declaration::TSModuleDeclaration(d) => {
-      match &d.id {
-        TSModuleDeclarationName::Identifier(ident) => {
-          exports.push(ident.name.to_string());
-        }
-        TSModuleDeclarationName::StringLiteral(_) => {
-          // ignore
-        }
-      }
-    }
-    Declaration::TSInterfaceDeclaration(_)
-    | Declaration::TSTypeAliasDeclaration(_)
-    | Declaration::TSGlobalDeclaration(_)
-    | Declaration::TSImportEqualsDeclaration(_) => {
-      // ignore
-    }
-  }
-}
-
-fn collect_binding_pattern_names(
-  pattern: &BindingPattern,
-  names: &mut Vec<String>,
-) {
-  if let Some(ident) = pattern.get_binding_identifier() {
-    names.push(ident.name.to_string());
-  }
-  // For complex patterns (object/array destructuring), we'd need to recurse,
-  // but for export declarations the pattern is typically a simple identifier.
 }
 
 #[cfg(test)]
@@ -187,8 +145,59 @@ export { z } from './other.js';
   }
 
   #[test]
+  fn runtime_exports_source_order() {
+    let tester = parse(
+      "
+export { z } from './other.js';
+export const a = 1;
+export * as y from './other.js';
+export enum B {}
+export namespace C {}
+",
+    );
+    tester.assert_exports(vec!["z", "a", "y", "B", "C"]);
+  }
+
+  #[test]
+  fn runtime_exports_destructuring() {
+    let tester = parse(
+      "
+export const { a, b: [c, ...d], ...e } = obj;
+export let [f, { g = 1 }] = arr;
+",
+    );
+    tester.assert_exports(vec!["a", "c", "d", "e", "f", "g"]);
+  }
+
+  #[test]
+  fn runtime_exports_ignores_types() {
+    let tester = parse(
+      "
+export interface A {}
+export type B = string;
+export type { C };
+export { type D, e } from './other.js';
+export type * from './types.js';
+export declare const f: number;
+export const g = 1;
+",
+    );
+    tester.assert_exports(vec!["e", "g"]);
+  }
+
+  #[test]
   fn runtime_exports_default_expr() {
     let tester = parse("export default 5;");
+    tester.assert_exports(vec!["default"]);
+  }
+
+  #[test]
+  fn runtime_exports_default_decl() {
+    let tester = parse("export default class A {}");
+    tester.assert_exports(vec!["default"]);
+    let tester = parse("export default function () {}");
+    tester.assert_exports(vec!["default"]);
+    let tester = parse("export { a as default };");
     tester.assert_exports(vec!["default"]);
   }
 
@@ -196,5 +205,13 @@ export { z } from './other.js';
   fn runtime_re_export() {
     let tester = parse("export * from './other.js';");
     tester.assert_reexports(vec!["./other.js"]);
+  }
+
+  #[test]
+  fn runtime_exports_ignores_cjs_syntax() {
+    let tester = parse("export = 5;");
+    tester.assert_empty();
+    let tester = parse("import a = require('./a'); export as namespace A;");
+    tester.assert_empty();
   }
 }

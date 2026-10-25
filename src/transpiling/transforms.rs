@@ -1,12 +1,16 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 use oxc::allocator::Allocator;
+use oxc::allocator::ArenaVec;
 use oxc::allocator::CloneIn;
-use oxc::ast::AstBuilder;
+use oxc::allocator::GetAllocator;
 use oxc::ast::ast::*;
+use oxc::ast::builder::AstBuilder;
 use oxc::ast_visit::VisitMut;
 use oxc::ast_visit::walk_mut;
 use oxc::span::SPAN;
+
+use crate::JSStrExt;
 
 /// Transforms import declarations to variable declarations
 /// with a dynamic import. This is used to provide import
@@ -28,7 +32,7 @@ impl<'a> VisitMut<'a> for ImportDeclsToVarDecls<'a> {
     &mut self,
     stmts: &mut oxc::allocator::Vec<'a, Statement<'a>>,
   ) {
-    let mut new_stmts = self.ast.vec_with_capacity(stmts.len());
+    let mut new_stmts = ArenaVec::with_capacity_in(stmts.len(), &self.ast);
     for stmt in stmts.drain(..) {
       match stmt {
         Statement::ImportDeclaration(import_decl) => {
@@ -37,48 +41,55 @@ impl<'a> VisitMut<'a> for ImportDeclsToVarDecls<'a> {
             continue;
           }
 
-          let source_value = import_decl.source.value.as_str();
+          let source_value = import_decl.source.value.to_str_lossy();
 
           // Side-effect only import: `import "./mod.ts"` -> `await import("./mod.ts")`
           if import_decl.specifiers.as_ref().is_none_or(|s| s.is_empty()) {
-            let import_expr = self.create_await_import_expr(source_value);
-            new_stmts.push(self.ast.statement_expression(SPAN, import_expr));
+            let import_expr = self.create_await_import_expr(&source_value);
+            new_stmts.push(Statement::new_expression_statement(
+              SPAN,
+              import_expr,
+              &self.ast,
+            ));
             continue;
           }
 
           let specifiers = import_decl.specifiers.as_ref().unwrap();
 
           // Collect named/default imports for destructuring
-          let mut props = self.ast.vec();
+          let mut props = ArenaVec::new_in(&self.ast);
           let mut namespace_name: Option<&str> = None;
 
           for specifier in specifiers {
             match specifier {
               ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                let key =
-                  self.ast.property_key_static_identifier(SPAN, "default");
-                let value = self.ast.binding_pattern_binding_identifier(
+                let key = PropertyKey::new_static_identifier(
+                  SPAN, "default", &self.ast,
+                );
+                let value = BindingPattern::new_binding_identifier(
                   SPAN,
                   s.local.name.as_str(),
+                  &self.ast,
                 );
-                props.push(
-                  self.ast.binding_property(SPAN, key, value, false, false),
-                );
+                props.push(BindingProperty::new(
+                  SPAN, key, value, false, false, &self.ast,
+                ));
               }
               ImportDeclarationSpecifier::ImportSpecifier(s) => {
                 let imported_name = s.imported.name();
                 let local_name = s.local.name.as_str();
                 let shorthand = imported_name == local_name;
-                let key =
-                  self.ast.property_key_static_identifier(SPAN, imported_name);
-                let value = self
-                  .ast
-                  .binding_pattern_binding_identifier(SPAN, local_name);
-                props.push(
-                  self
-                    .ast
-                    .binding_property(SPAN, key, value, shorthand, false),
+                let key = PropertyKey::new_static_identifier(
+                  SPAN,
+                  imported_name,
+                  &self.ast,
                 );
+                let value = BindingPattern::new_binding_identifier(
+                  SPAN, local_name, &self.ast,
+                );
+                props.push(BindingProperty::new(
+                  SPAN, key, value, shorthand, false, &self.ast,
+                ));
               }
               ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
                 namespace_name = Some(s.local.name.as_str());
@@ -86,46 +97,45 @@ impl<'a> VisitMut<'a> for ImportDeclsToVarDecls<'a> {
             }
           }
 
-          let import_expr = self.create_await_import_expr(source_value);
+          let import_expr = self.create_await_import_expr(&source_value);
 
-          let mut declarators = self.ast.vec();
+          let mut declarators = ArenaVec::new_in(&self.ast);
 
           if !props.is_empty() {
-            let pattern = self.ast.binding_pattern_object_pattern(
+            let pattern =
+              BindingPattern::new_object_pattern(SPAN, props, None, &self.ast);
+            declarators.push(VariableDeclarator::new(
               SPAN,
-              props,
-              None::<BindingRestElement<'a>>,
-            );
-            declarators.push(self.ast.variable_declarator(
-              SPAN,
-              VariableDeclarationKind::Const,
               pattern,
-              None::<TSTypeAnnotation<'a>>,
-              Some(import_expr.clone_in(self.ast.allocator)),
+              None,
+              Some(import_expr.clone_in(self.ast.allocator())),
               false,
+              &self.ast,
             ));
           }
 
           if let Some(ns_name) = namespace_name {
             let pattern =
-              self.ast.binding_pattern_binding_identifier(SPAN, ns_name);
-            declarators.push(self.ast.variable_declarator(
+              BindingPattern::new_binding_identifier(SPAN, ns_name, &self.ast);
+            declarators.push(VariableDeclarator::new(
               SPAN,
-              VariableDeclarationKind::Const,
               pattern,
-              None::<TSTypeAnnotation<'a>>,
+              None,
               Some(import_expr),
               false,
+              &self.ast,
             ));
           }
 
           if !declarators.is_empty() {
-            let var_decl = Statement::from(self.ast.declaration_variable(
-              SPAN,
-              VariableDeclarationKind::Const,
-              declarators,
-              false,
-            ));
+            let var_decl =
+              Statement::from(Declaration::new_variable_declaration(
+                SPAN,
+                VariableDeclarationKind::Const,
+                declarators,
+                false,
+                &self.ast,
+              ));
             new_stmts.push(var_decl);
           }
         }
@@ -144,14 +154,17 @@ impl<'a> VisitMut<'a> for ImportDeclsToVarDecls<'a> {
 impl<'a> ImportDeclsToVarDecls<'a> {
   fn create_await_import_expr(&self, source: &str) -> Expression<'a> {
     let source_in_alloc =
-      oxc::allocator::StringBuilder::from_str_in(source, self.ast.allocator);
-    let import_arg = self.ast.expression_string_literal(
+      oxc::allocator::StringBuilder::from_str_in(source, self.ast.allocator());
+    let import_arg = Expression::new_string_literal(
       SPAN,
       source_in_alloc.into_str(),
       None,
+      &self.ast,
     );
-    let import_call = self.ast.expression_import(SPAN, import_arg, None, None);
-    self.ast.expression_await(SPAN, import_call)
+    let import_call = Expression::new_import_expression(
+      SPAN, import_arg, None, None, &self.ast,
+    );
+    Expression::new_await_expression(SPAN, import_call, &self.ast)
   }
 }
 
@@ -175,22 +188,31 @@ impl<'a> VisitMut<'a> for StripExports<'a> {
     &mut self,
     stmts: &mut oxc::allocator::Vec<'a, Statement<'a>>,
   ) {
-    let mut new_stmts = self.ast.vec_with_capacity(stmts.len());
+    let mut new_stmts = ArenaVec::with_capacity_in(stmts.len(), &self.ast);
     for stmt in stmts.drain(..) {
       match stmt {
         Statement::ExportAllDeclaration(export_all) => {
-          let source_value = export_all.source.value.as_str();
-          let import_expr = self.create_await_import_expr(source_value);
-          new_stmts.push(self.ast.statement_expression(SPAN, import_expr));
+          let source_value = export_all.source.value.to_str_lossy();
+          let import_expr = self.create_await_import_expr(&source_value);
+          new_stmts.push(Statement::new_expression_statement(
+            SPAN,
+            import_expr,
+            &self.ast,
+          ));
         }
-        Statement::ExportNamedDeclaration(export_named) => {
-          if let Some(source) = &export_named.source {
-            let source_value = source.value.as_str();
-            let import_expr = self.create_await_import_expr(source_value);
-            new_stmts.push(self.ast.statement_expression(SPAN, import_expr));
-          } else if let Some(decl) = export_named.unbox().declaration {
-            new_stmts.push(Statement::from(decl));
-          }
+        Statement::ExportFromDeclaration(export_from) => {
+          let source_value = export_from.source.value.to_str_lossy();
+          let import_expr = self.create_await_import_expr(&source_value);
+          new_stmts.push(Statement::new_expression_statement(
+            SPAN,
+            import_expr,
+            &self.ast,
+          ));
+        }
+        Statement::ExportDeclaration(export_decl) => {
+          new_stmts.push(Statement::from(export_decl.unbox().declaration));
+        }
+        Statement::ExportNamedDeclaration(_) => {
           // `export { test }` -> remove entirely
         }
         Statement::ExportDefaultDeclaration(export_default) => {
@@ -214,7 +236,9 @@ impl<'a> VisitMut<'a> for StripExports<'a> {
               // so all remaining variants are expressions.
               if kind.is_expression() {
                 let expr = kind.into_expression();
-                new_stmts.push(self.ast.statement_expression(SPAN, expr));
+                new_stmts.push(Statement::new_expression_statement(
+                  SPAN, expr, &self.ast,
+                ));
               }
             }
           }
@@ -232,14 +256,17 @@ impl<'a> VisitMut<'a> for StripExports<'a> {
 impl<'a> StripExports<'a> {
   fn create_await_import_expr(&self, source: &str) -> Expression<'a> {
     let source_in_alloc =
-      oxc::allocator::StringBuilder::from_str_in(source, self.ast.allocator);
-    let import_arg = self.ast.expression_string_literal(
+      oxc::allocator::StringBuilder::from_str_in(source, self.ast.allocator());
+    let import_arg = Expression::new_string_literal(
       SPAN,
       source_in_alloc.into_str(),
       None,
+      &self.ast,
     );
-    let import_call = self.ast.expression_import(SPAN, import_arg, None, None);
-    self.ast.expression_await(SPAN, import_call)
+    let import_call = Expression::new_import_expression(
+      SPAN, import_arg, None, None, &self.ast,
+    );
+    Expression::new_await_expression(SPAN, import_call, &self.ast)
   }
 }
 

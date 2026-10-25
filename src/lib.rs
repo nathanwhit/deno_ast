@@ -24,6 +24,7 @@ mod parsing;
 #[cfg(feature = "scopes")]
 mod scopes;
 mod source_range;
+mod str_ext;
 mod text_changes;
 #[cfg(feature = "transpiling")]
 mod transpiling;
@@ -42,6 +43,7 @@ pub use parsing::*;
 #[cfg(feature = "scopes")]
 pub use scopes::*;
 pub use source_range::*;
+pub use str_ext::*;
 pub use text_changes::*;
 #[cfg(feature = "transpiling")]
 pub use transpiling::*;
@@ -62,11 +64,12 @@ pub mod oxc {
   #[cfg(feature = "semantic")]
   pub use oxc::semantic;
   /// Re-export of `oxc::span` plus the string types (`Str`, `Ident`,
-  /// `CompactStr`) that moved to `oxc_str` in oxc 0.134.
+  /// `CompactStr`) that moved to `oxc::str` in oxc 0.134.
   pub mod span {
     pub use oxc::span::*;
-    pub use oxc_str::{CompactStr, Ident, Str};
+    pub use oxc::str::{CompactStr, Ident, Str};
   }
+  pub use oxc::str;
   pub use oxc::syntax;
   #[cfg(feature = "transpiling")]
   pub use oxc::transformer;

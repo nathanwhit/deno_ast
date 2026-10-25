@@ -613,8 +613,8 @@ mod tests {
     fn location(&self) -> DiagnosticLocation<'_> {
       DiagnosticLocation::ModulePosition {
         specifier: Cow::Owned("file:///test.ts".parse().unwrap()),
-        source_pos: DiagnosticSourcePos::SourcePos(
-          self.range.start.pos(&self.text_info),
+        source_pos: DiagnosticSourcePos::ByteIndex(
+          self.range.start.byte_index(&self.text_info),
         ),
         text_info: Cow::Borrowed(&self.text_info),
       }

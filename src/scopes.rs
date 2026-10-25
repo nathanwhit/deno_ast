@@ -255,8 +255,17 @@ impl<'a> Visit<'a> for Analyzer<'_> {
       if let Some(rest) = &expr.params.rest {
         a.declare_binding_pattern(BindingKind::Param, &rest.rest.argument);
       }
-      for stmt in &expr.body.statements {
-        a.visit_statement(stmt);
+      match &expr.body {
+        ArrowFunctionBody::FunctionBody(body) => {
+          for stmt in &body.statements {
+            a.visit_statement(stmt);
+          }
+        }
+        body => {
+          if let Some(expr) = body.as_expression() {
+            a.visit_expression(expr);
+          }
+        }
       }
     });
   }
