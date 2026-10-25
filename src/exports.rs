@@ -134,14 +134,42 @@ mod test {
     let tester = parse(
       "
 export class A {}
+export enum B {}
+export module C.Test {}
+export namespace C2.Test {}
 export function d() {}
 export const e = 1, f = 2;
-export { g, h1 as h };
+export { g, h1 as h, other as 'testing-this' };
 export * as y from './other.js';
 export { z } from './other.js';
+class Ignored1 {}
+enum Ignored2 {}
+module Ignored3 {}
+namespace Ignored4 {}
+function Ignored5() {}
+const Ignored6 = 1;
 ",
     );
-    tester.assert_exports(vec!["A", "d", "e", "f", "g", "h", "y", "z"]);
+    tester.assert_exports(vec![
+      "A",
+      "B",
+      "C",
+      "C2",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "testing-this",
+      "y",
+      "z",
+    ]);
+  }
+
+  #[test]
+  fn runtime_exports_default_named_export() {
+    let tester = parse("export { a as default }");
+    tester.assert_exports(vec!["default"]);
   }
 
   #[test]

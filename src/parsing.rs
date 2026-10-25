@@ -458,6 +458,59 @@ mod test {
     }
   }
 
+  fn parse_ts_module(text: &str) -> Result<ParseDiagnostic, ParseDiagnostic> {
+    let allocator = Allocator::default();
+    parse_module(
+      &allocator,
+      ParseParams {
+        specifier: ModuleSpecifier::parse("file:///my_file.ts").unwrap(),
+        text: text.to_string().into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .map(|parsed| parsed.diagnostics().first().cloned().unwrap())
+  }
+
+  #[test]
+  fn test_err_trailing_blank_line() {
+    let diagnostic = parse_ts_module("setTimeout(() => {}),\n").err().unwrap();
+    assert_eq!(
+      diagnostic.to_string(),
+      // should contain some context by including the previous line
+      // instead of just a blank line
+      [
+        "SyntaxError: Unexpected token",
+        "  |",
+        "1 | setTimeout(() => {}),",
+        "  |                      ~",
+        "    at file:///my_file.ts:1:22",
+      ]
+      .join("\n")
+    );
+  }
+
+  #[test]
+  fn test_err_many_trailing_blank_lines() {
+    let diagnostic = parse_ts_module("setTimeout(() => {}),\n\n\n\n\n\n\n\n")
+      .err()
+      .unwrap();
+    assert_eq!(
+      diagnostic.to_string(),
+      // should contain some context by including the expression
+      [
+        "SyntaxError: Unexpected token",
+        "  |",
+        "1 | setTimeout(() => {}),",
+        "  |                      ~",
+        "    at file:///my_file.ts:1:22",
+      ]
+      .join("\n")
+    );
+  }
+
   #[test]
   fn test_strip_bom() {
     let text = "\u{FEFF}test";

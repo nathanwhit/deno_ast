@@ -110,12 +110,21 @@ pub fn emit(
   let mut map: Option<Vec<u8>> = None;
 
   if need_source_map && let Some(mut source_map) = codegen_ret.map {
-    // Apply source_map_base: make source paths relative to the base URL
+    // Apply source_map_base: make source urls relative to the base url
     if let Some(base) = &emit_options.source_map_base {
-      let base_str = base.as_str();
+      debug_assert!(
+        base.as_str().ends_with('/'),
+        "source map base should end with a slash"
+      );
       let new_sources: Vec<String> = source_map
         .get_sources()
-        .map(|s| s.strip_prefix(base_str).unwrap_or(s.as_ref()).to_string())
+        .map(|source| {
+          ModuleSpecifier::parse(source)
+            .ok()
+            .and_then(|specifier| base.make_relative(&specifier))
+            .filter(|relative| !relative.is_empty())
+            .unwrap_or_else(|| source.to_string())
+        })
         .collect();
       source_map.set_sources(new_sources);
     }

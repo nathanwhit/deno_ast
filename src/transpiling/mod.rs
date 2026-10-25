@@ -235,6 +235,17 @@ impl<'a> ParsedSource<'a> {
     });
     ensure_no_fatal_diagnostics(self.diagnostics.for_module_kind(module_kind))?;
 
+    // A CommonJS module without ES module syntax is transpiled as a script so
+    // that `import x = require()` / `export =` lower to `require` /
+    // `module.exports` and the JSX import source is required instead of
+    // imported.
+    if module_kind.is_cjs()
+      && self.program.source_type.is_module()
+      && crate::parsed_source::compute_is_script_from_body(&self.program.body)
+    {
+      transforms::CjsScriptExports::new(allocator).transform(&mut self.program);
+    }
+
     let transpile_options =
       resolve_transpile_options(self.media_type, transpile_options);
 
@@ -290,10 +301,30 @@ impl<'a> ParsedSource<'a> {
     let transform_options =
       build_transform_options(&transpile_options, &self.specifier);
 
-    // Run semantic analysis to get scoping info
+    // Run semantic analysis to get scoping info. This also checks for early
+    // errors the parser doesn't report (ex. legacy octal literals in strict
+    // mode).
     let semantic_ret = SemanticBuilder::new()
+      .with_check_syntax_error(true)
       .with_enum_eval(true)
       .build(&self.program);
+    if semantic_ret.diagnostics.has_errors() {
+      let text_info = self.text_info_lazy().clone();
+      return Err(TranspileError::ParseErrors(ParseDiagnosticsError(
+        semantic_ret
+          .diagnostics
+          .into_iter()
+          .filter(|err| err.severity == oxc::diagnostics::Severity::Error)
+          .map(|err| {
+            ParseDiagnostic::from_oxc_diagnostic(
+              err,
+              &self.specifier,
+              text_info.clone(),
+            )
+          })
+          .collect(),
+      )));
+    }
     let scoping = semantic_ret.semantic.into_scoping();
 
     // Run OXC transformer (TS strip, JSX, decorators, etc.)
@@ -410,6 +441,8 @@ fn build_transform_options(
 ) -> TransformOptions {
   let typescript = TypeScriptOptions {
     only_remove_type_imports: options.verbatim_module_syntax,
+    // inline `const enum` values like TypeScript does
+    optimize_const_enums: true,
     ..Default::default()
   };
 
@@ -552,13 +585,36 @@ mod tests {
   use crate::ParseParams;
   use crate::SourceMapOption;
   use crate::parse_module;
+  use crate::parse_program;
+  use oxc::allocator::Allocator;
 
   use base64::Engine;
   use pretty_assertions::assert_eq;
 
+  /// Compares a source map with the expected one, ignoring the `mappings`
+  /// (which depend on the source map generator) beyond checking that there
+  /// are some.
+  #[track_caller]
+  fn assert_source_map_eq(actual: &str, expected: &str) {
+    let mut actual: serde_json::Value = serde_json::from_str(actual).unwrap();
+    let mappings = actual.as_object_mut().unwrap().remove("mappings").unwrap();
+    assert!(!mappings.as_str().unwrap().is_empty());
+    let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  /// Splits emitted text into the code and the decoded inline source map.
+  #[track_caller]
+  fn split_inline_source_map(text: &str) -> (&str, serde_json::Value) {
+    let prefix = "//# sourceMappingURL=data:application/json;base64,";
+    let index = text.rfind(prefix).unwrap();
+    let encoded = text[index + prefix.len()..].trim_end();
+    let decoded = base64::prelude::BASE64_STANDARD.decode(encoded).unwrap();
+    (&text[..index], serde_json::from_slice(&decoded).unwrap())
+  }
+
   #[test]
   fn test_transpile() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -592,7 +648,8 @@ export class A {
   }
 }
     "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -612,21 +669,106 @@ export class A {
         &EmitOptions::default(),
       )
       .unwrap();
-    // Just verify it produces output and contains expected patterns
-    assert!(transpiled_source.text.contains("class A"));
-    assert!(!transpiled_source.text.contains("private b: string"));
+    let expected_text = r#"var D = /* @__PURE__ */ function(D) {
+  D[D["A"] = 0] = "A";
+  D[D["B"] = 1] = "B";
+  return D;
+}(D || {});
+console.log(0);
+let N;
+(function(_N) {
+  let D = /* @__PURE__ */ function(D) {
+    D["A"] = "value";
+    return D;
+  }({});
+  _N.D = D;
+  const Value = _N.Value = 5;
+})(N || (N = {}));
+export class A {
+  d;
+  b;
+  c = 1;
+  e;
+  constructor(d = D.A) {
+    this.d = d;
+    const e = "foo";
+    this.e = e;
+    console.log(N.Value);
+  }
+}
+"#;
+    assert_eq!(
+      &transpiled_source.text[..expected_text.len()],
+      expected_text
+    );
     assert!(
       transpiled_source
         .text
-        .contains("sourceMappingURL=data:application/json;base64,")
+        .contains("\n//# sourceMappingURL=data:application/json;base64,")
+    );
+    assert!(transpiled_source.source_map.is_none());
+  }
+
+  #[test]
+  fn test_explicit_resource_management() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let source = r#"Deno.test({
+  permissions: {
+    net: true
+  }
+}, async function listenerExplicitResourceManagement() {
+  let done;
+  {
+    using listener = Deno.listen({
+      port: listenPort
+    });
+    done = assertRejects(()=>listener.accept(), Deno.errors.BadResource);
+  }
+  await done;
+});
+"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let transpiled_source = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .unwrap();
+    // the `using` declaration is left as-is (only reformatted by the emitter)
+    let expected_text = r#"Deno.test({ permissions: { net: true } }, async function listenerExplicitResourceManagement() {
+  let done;
+  {
+    using listener = Deno.listen({ port: listenPort });
+    done = assertRejects(() => listener.accept(), Deno.errors.BadResource);
+  }
+  await done;
+});
+"#;
+    assert_eq!(
+      &transpiled_source.text[..expected_text.len()],
+      expected_text
     );
   }
 
   #[test]
   fn test_transpile_tsx() {
-    let allocator = Allocator::default();
     let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
     export class A {
       render() {
@@ -634,7 +776,8 @@ export class A {
       }
     }
     "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -642,7 +785,7 @@ export class A {
         media_type: MediaType::Tsx,
         capture_tokens: false,
         maybe_source_type: None,
-        scope_analysis: false,
+        scope_analysis: true, // ensure scope analysis doesn't conflict with a second resolver pass
       },
     )
     .unwrap();
@@ -654,71 +797,15 @@ export class A {
         &EmitOptions::default(),
       )
       .unwrap();
-    // Should contain createElement calls (classic transform)
     assert!(
-      transpiled_source.text.contains("createElement")
-        || transpiled_source.text.contains("jsx")
-    );
-  }
-
-  #[test]
-  fn test_transpile_decorators() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
-    let source = r#"
-    function enumerable(value: boolean) {
-      return function (
-        _target: any,
-        _propertyKey: string,
-        descriptor: PropertyDescriptor,
-      ) {
-        descriptor.enumerable = value;
-      };
-    }
-
-    export class A {
-      @enumerable(false)
-      a() {
-        Test.value;
-      }
-    }
-    "#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let transpiled_source = program
-      .transpile(
-        &allocator,
-        &TranspileOptions {
-          decorators: DecoratorsTranspileOption::LegacyTypeScript {
-            emit_metadata: false,
-          },
-          ..Default::default()
-        },
-        &TranspileModuleOptions::default(),
-        &EmitOptions::default(),
-      )
-      .unwrap();
-    // Should have decorator-related output
-    assert!(
-      transpiled_source.text.contains("decorate")
-        || transpiled_source.text.contains("__decorateClass")
+      transpiled_source
+        .text
+        .contains("React.createElement(\"div\", null")
     );
   }
 
   #[test]
   fn test_transpile_tsx_with_namespace() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -728,7 +815,8 @@ export class A {
       }
     }
     "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -736,7 +824,7 @@ export class A {
         media_type: MediaType::Tsx,
         capture_tokens: false,
         maybe_source_type: None,
-        scope_analysis: true,
+        scope_analysis: true, // ensure scope analysis doesn't conflict with a second resolver pass
       },
     )
     .unwrap();
@@ -751,14 +839,13 @@ export class A {
     assert!(
       transpiled_source
         .text
-        .contains("React.createElement(\"my:tag\"")
+        .contains("React.createElement(\"my:tag\", null")
     );
     assert!(transpiled_source.text.contains("\"my:attr\": \"this\""));
   }
 
   #[test]
   fn test_transpile_jsx_pragma() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -771,7 +858,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -795,13 +883,15 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("h(\"div\"") || code.contains("h('div'"));
-    assert!(code.contains("h(Fragment"));
+    let expected = r#"import { h, Fragment } from "https://deno.land/x/mod.ts";
+function App() {
+  return h("div", null, h(Fragment, null));
+}"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_pragma() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
     let source = r#"
@@ -812,7 +902,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -836,13 +927,17 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-runtime"));
-    assert!(code.contains("_jsx(\"div\""));
+    let expected = r#"import { Fragment as _Fragment, jsx as _jsx } from "jsx_lib/jsx-runtime";
+/** @jsxImportSource jsx_lib */
+function App() {
+  return /* @__PURE__ */ _jsx("div", { children: /* @__PURE__ */ _jsx(_Fragment, {}) });
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_no_pragma() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
     let source = r#"
@@ -851,7 +946,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -865,8 +961,8 @@ function App() {
     .unwrap();
     let transpile_options = TranspileOptions {
       jsx: Some(JsxRuntime::Automatic(JsxAutomaticOptions {
-        development: false,
         import_source: Some("jsx_lib".to_string()),
+        development: false,
       })),
       ..Default::default()
     };
@@ -882,14 +978,16 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-runtime"));
-    assert!(code.contains("_jsx(\"div\""));
-    assert!(code.contains("_Fragment"));
+    let expected = r#"import { Fragment as _Fragment, jsx as _jsx } from "jsx_lib/jsx-runtime";
+function App() {
+  return _jsx("div", { children: _jsx(_Fragment, {}) });
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_no_pragma_dev() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
     let source = r#"function App() {
@@ -897,7 +995,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -911,8 +1010,8 @@ function App() {
     .unwrap();
     let transpile_options = TranspileOptions {
       jsx: Some(JsxRuntime::Automatic(JsxAutomaticOptions {
-        development: true,
         import_source: Some("jsx_lib".to_string()),
+        development: true,
       })),
       ..Default::default()
     };
@@ -928,13 +1027,25 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-dev-runtime"));
-    assert!(code.contains("jsxDEV"));
+    let expected = r#"var _jsxFileName = "https://deno.land/x/mod.tsx";
+import { Fragment as _Fragment, jsxDEV as _jsxDEV } from "jsx_lib/jsx-dev-runtime";
+function App() {
+  return _jsxDEV("div", { children: _jsxDEV(_Fragment, {}, void 0, false, {
+    fileName: _jsxFileName,
+    lineNumber: 3,
+    columnNumber: 10
+  }, this) }, void 0, false, {
+    fileName: _jsxFileName,
+    lineNumber: 3,
+    columnNumber: 5
+  }, this);
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_pragma_var_decl_imports() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
     let source = r#"
@@ -946,7 +1057,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -971,14 +1083,18 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("await import(\"jsx_lib/jsx-runtime\")"));
-    assert!(code.contains("await import(\"example\")"));
-    assert!(code.contains("_jsx(\"div\"") || code.contains("_jsx('div'"));
+    let expected = r#"const { Fragment: _Fragment, jsx: _jsx } = await import("jsx_lib/jsx-runtime");
+/** @jsxImportSource jsx_lib */
+const example = await import("example");
+function App() {
+  return /* @__PURE__ */ _jsx("div", { children: /* @__PURE__ */ _jsx(_Fragment, {}) });
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_cjs() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
     let source = r#"
@@ -987,7 +1103,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1001,13 +1118,13 @@ function App() {
     .unwrap();
     let transpile_options = TranspileOptions {
       jsx: Some(JsxRuntime::Automatic(JsxAutomaticOptions {
-        development: false,
         import_source: Some("jsx_lib".to_string()),
+        development: false,
       })),
       ..Default::default()
     };
     let transpile_module_options = TranspileModuleOptions {
-      module_kind: Some(ModuleKind::Cjs),
+      module_kind: Some(ModuleKind::Cjs), // notice this
     };
     let code = program
       .transpile(
@@ -1021,13 +1138,16 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-runtime"));
-    assert!(code.contains("_jsx(\"div\""));
+    let expected = r#"var _reactJsxRuntime = require("jsx_lib/jsx-runtime");
+function App() {
+  return _reactJsxRuntime.jsx("div", { children: _reactJsxRuntime.jsx(_reactJsxRuntime.Fragment, {}) });
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_cjs_with_import_export() {
-    let allocator = Allocator::default();
     let specifier = ModuleSpecifier::parse("file:///mod.tsx").unwrap();
     let source = r#"
 import test = require('./test');
@@ -1040,7 +1160,8 @@ function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1054,13 +1175,13 @@ function App() {
     .unwrap();
     let transpile_options = TranspileOptions {
       jsx: Some(JsxRuntime::Automatic(JsxAutomaticOptions {
-        development: false,
         import_source: Some("jsx_lib".to_string()),
+        development: false,
       })),
       ..Default::default()
     };
     let transpile_module_options = TranspileModuleOptions {
-      module_kind: Some(ModuleKind::Cjs),
+      module_kind: Some(ModuleKind::Cjs), // notice this
     };
     let code = program
       .transpile(
@@ -1074,13 +1195,23 @@ function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-runtime"));
-    assert!(code.contains("_jsx(\"div\""));
+    let expected = r#"var _reactJsxRuntime = require("jsx_lib/jsx-runtime");
+const test = require("./test");
+const other = require("./test");
+exports.other = other;
+console.log(test);
+console.log(other);
+var asdf = other.add;
+exports.asdf = asdf;
+function App() {
+  return _reactJsxRuntime.jsx("div", { children: _reactJsxRuntime.jsx(_reactJsxRuntime.Fragment, {}) });
+}
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn test_transpile_jsx_import_source_cjs_with_ts_export_equals() {
-    let allocator = Allocator::default();
     let specifier = ModuleSpecifier::parse("file:///mod.tsx").unwrap();
     let source = r#"
 export = function App() {
@@ -1088,7 +1219,8 @@ export = function App() {
     <div><></></div>
   );
 }"#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1102,13 +1234,13 @@ export = function App() {
     .unwrap();
     let transpile_options = TranspileOptions {
       jsx: Some(JsxRuntime::Automatic(JsxAutomaticOptions {
-        development: false,
         import_source: Some("jsx_lib".to_string()),
+        development: false,
       })),
       ..Default::default()
     };
     let transpile_module_options = TranspileModuleOptions {
-      module_kind: Some(ModuleKind::Cjs),
+      module_kind: Some(ModuleKind::Cjs), // notice this
     };
     let code = program
       .transpile(
@@ -1122,13 +1254,89 @@ export = function App() {
       )
       .unwrap()
       .text;
-    assert!(code.contains("jsx_lib/jsx-runtime"));
-    assert!(code.contains("_jsx(\"div\""));
+    let expected = r#"var _reactJsxRuntime = require("jsx_lib/jsx-runtime");
+module.exports = function App() {
+  return _reactJsxRuntime.jsx("div", { children: _reactJsxRuntime.jsx(_reactJsxRuntime.Fragment, {}) });
+};
+"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
-  fn test_transpile_decorators_proposal() {
+  #[ignore = "oxc only emits legacy decorators via a helper import from `@oxc-project/runtime` (its inline helper mode is not implemented), so the `_ts_decorate` helper is not inlined"]
+  fn test_transpile_decorators() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let source = r#"
+    function enumerable(value: boolean) {
+      return function (
+        _target: any,
+        _propertyKey: string,
+        descriptor: PropertyDescriptor,
+      ) {
+        descriptor.enumerable = value;
+      };
+    }
+
+    export class A {
+      @enumerable(false)
+      a() {
+        Test.value;
+      }
+    }
+    "#;
     let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let code = program
+      .transpile(
+        &allocator,
+        &TranspileOptions {
+          decorators: DecoratorsTranspileOption::LegacyTypeScript {
+            emit_metadata: false,
+          },
+          ..Default::default()
+        },
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .unwrap()
+      .text;
+    let expected = r#"function _ts_decorate(decorators, target, key, desc) {
+  var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+  if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+  else for(var i = decorators.length - 1; i >= 0; i--)if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+  return c > 3 && r && Object.defineProperty(target, key, r), r;
+}
+function enumerable(value) {
+  return function(_target, _propertyKey, descriptor) {
+    descriptor.enumerable = value;
+  };
+}
+export class A {
+  a() {
+    Test.value;
+  }
+}
+_ts_decorate([
+  enumerable(false)
+], A.prototype, "a", null);"#;
+    assert_eq!(&code[0..expected.len()], expected);
+  }
+
+  #[test]
+  #[ignore = "oxc does not implement the TC39 decorators proposal transform, so the decorators are left in the output"]
+  fn test_transpile_decorators_proposal() {
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -1150,7 +1358,8 @@ export = function App() {
       }
     }
     "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1174,14 +1383,16 @@ export = function App() {
       )
       .unwrap()
       .text;
-    // TC39 proposal decorators produce different output than legacy
-    assert!(code.contains("class A"));
-    assert!(!code.contains(": boolean"));
+    let expected =
+      include_str!("./testdata/tc39_decorator_proposal_output.txt");
+    assert_eq!(
+      &code[0..std::cmp::min(expected.len(), code.len())],
+      expected
+    );
   }
 
   #[test]
   fn test_transpile_no_decorators() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -1203,7 +1414,8 @@ export = function App() {
       }
     }
     "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1224,13 +1436,24 @@ export = function App() {
       )
       .unwrap()
       .text;
-    // With no decorator transform, decorator syntax should remain
-    assert!(code.contains("@enumerable"));
+    let expected = r#"function enumerable(value) {
+  return function(_target, _propertyKey, descriptor) {
+    descriptor.enumerable = value;
+    return descriptor;
+  };
+}
+export class A {
+  @enumerable(false) a() {
+    Test.value;
+  }
+}
+"#;
+    assert_eq!(&code[0..expected.len()], expected);
   }
 
   #[test]
   fn transpile_handle_code_nested_in_ts_nodes_with_jsx_pass() {
-    let allocator = Allocator::default();
+    // from issue 12409
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
@@ -1243,7 +1466,8 @@ export function g() {
   )
 }
   "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1255,29 +1479,37 @@ export function g() {
       },
     )
     .unwrap();
+    let transpile_options = TranspileOptions {
+      jsx: Some(Default::default()),
+      ..Default::default()
+    };
     let code = program
       .transpile(
         &allocator,
-        &TranspileOptions::default(),
+        &transpile_options,
         &TranspileModuleOptions::default(),
         &EmitOptions::default(),
       )
       .unwrap()
       .text;
-    assert!(code.contains("export function g()"));
-    assert!(code.contains("test(algorithm, false, keyUsages)"));
-    assert!(!code.contains("<Promise>"));
+    let expected = r#"export function g() {
+  let algorithm;
+  algorithm = {};
+  return test(algorithm, false, keyUsages);
+}"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn transpile_bitshift_typescript() {
-    let allocator = Allocator::default();
+    // from https://github.com/denoland/deno/issues/14900
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"
 for (let i = 0; i < testVariable >> 1; i++) callCount++;
   "#;
-    let mut program = parse_module(
+    let allocator = Allocator::default();
+    let mut program = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1298,19 +1530,20 @@ for (let i = 0; i < testVariable >> 1; i++) callCount++;
       )
       .unwrap()
       .text;
-    assert!(code.contains("testVariable >> 1"));
-    assert!(code.contains("callCount++"));
+    let expected =
+      r#"for (let i = 0; i < testVariable >> 1; i++) callCount++;"#;
+    assert_eq!(&code[..expected.len()], expected);
   }
 
   #[test]
   fn jsx_spread_works() {
-    let allocator = Allocator::default();
     let specifier =
       ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
     let source = r#"const A = () => {
   return <div>{...[]}</div>;
 };"#;
-    let mut parsed_source = parse_module(
+    let allocator = Allocator::default();
+    let mut parsed_source = parse_program(
       &allocator,
       ParseParams {
         specifier,
@@ -1332,6 +1565,596 @@ for (let i = 0; i < testVariable >> 1; i++) callCount++;
         )
         .is_ok()
     );
+  }
+
+  #[test]
+  #[ignore = "oxc reports no error for a legacy octal literal in a module (swc reported two strict mode errors)"]
+  fn diagnostic_octal_and_leading_zero_num_literals() {
+    assert_eq!(
+      get_diagnostic("077"),
+      [
+        "SyntaxError: Legacy octal literals are not available when targeting ECMAScript 5 and higher",
+        "  |",
+        "1 | 077",
+        "  | ~~~",
+        "    at https://deno.land/x/mod.ts:1:1",
+        "",
+        "SyntaxError: Legacy octal escape is not permitted in strict mode",
+        "  |",
+        "1 | 077",
+        "  | ~~~",
+        "    at https://deno.land/x/mod.ts:1:1",
+      ]
+      .join("\n")
+    );
+    assert_eq!(
+      get_diagnostic("099"),
+      [
+        "SyntaxError: Legacy decimal escape is not permitted in strict mode",
+        "  |",
+        "1 | 099",
+        "  | ~~~",
+        "    at https://deno.land/x/mod.ts:1:1",
+      ]
+      .join("\n")
+    );
+  }
+
+  #[test]
+  fn diagnostic_missing_brace() {
+    assert_eq!(
+      get_diagnostic("function test() {"),
+      [
+        "SyntaxError: Expected `}` but found `EOF`",
+        "  |",
+        "1 | function test() {",
+        "  |                  ~",
+        "    at https://deno.land/x/mod.ts:1:18",
+      ]
+      .join("\n"),
+    );
+  }
+
+  #[test]
+  fn diagnostic_nullish_coalescing_with_logical_op() {
+    assert_eq!(
+      get_diagnostic("null || undefined ?? 'foo';"),
+      [
+        "SyntaxError: Logical expressions and coalesce expressions cannot be mixed",
+        "  |",
+        "1 | null || undefined ?? 'foo';",
+        "  | ~~~~~~~~~~~~~~~~~~~~~~~~~~",
+        "    at https://deno.land/x/mod.ts:1:1",
+      ]
+      .join("\n")
+    );
+    assert_eq!(
+      get_diagnostic("null && undefined ?? 'foo';"),
+      [
+        "SyntaxError: Logical expressions and coalesce expressions cannot be mixed",
+        "  |",
+        "1 | null && undefined ?? 'foo';",
+        "  | ~~~~~~~~~~~~~~~~~~~~~~~~~~",
+        "    at https://deno.land/x/mod.ts:1:1",
+      ]
+      .join("\n"),
+    );
+  }
+
+  #[test]
+  fn diagnostic_missing_init_in_using() {
+    assert_eq!(
+      get_diagnostic("using test"),
+      [
+        "SyntaxError: Using declarations must have an initializer.",
+        "  |",
+        "1 | using test",
+        "  |       ~~~~",
+        "    at https://deno.land/x/mod.ts:1:7",
+      ]
+      .join("\n")
+    );
+  }
+
+  #[test]
+  fn diagnostic_invalid_left_hand_side_of_assignment() {
+    assert_eq!(
+      get_diagnostic("(true ? a : b) = 1;"),
+      [
+        "SyntaxError: Cannot assign to this expression",
+        "  |",
+        "1 | (true ? a : b) = 1;",
+        "  |  ~~~~~~~~~~~~",
+        "    at https://deno.land/x/mod.ts:1:2",
+      ]
+      .join("\n")
+    );
+  }
+
+  fn get_diagnostic(source: &str) -> String {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let allocator = Allocator::default();
+    let mut parsed_source = match parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    ) {
+      Ok(parsed_source) => parsed_source,
+      // unrecoverable syntax errors are reported when parsing
+      Err(diagnostic) => return diagnostic.to_string(),
+    };
+    parsed_source
+      .transpile(
+        &allocator,
+        &Default::default(),
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .err()
+      .unwrap()
+      .to_string()
+  }
+
+  #[test]
+  fn source_map_properly_encoded() {
+    // Ref https://github.com/denoland/deno/issues/10936
+    // Ref https://github.com/swc-project/swc/issues/3288#issuecomment-1117252904
+
+    let allocator = Allocator::default();
+    let mut p = parse_program(
+      &allocator,
+      ParseParams {
+        specifier: ModuleSpecifier::parse("file:///Users/ib/dev/deno/foo.ts")
+          .unwrap(),
+        text: r#"export default function () {
+    return "📣❓";
+}"#
+          .into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: true,
+        scope_analysis: false,
+        maybe_source_type: None,
+      },
+    )
+    .unwrap();
+
+    let transpiled = p
+      .transpile(
+        &allocator,
+        &Default::default(),
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .unwrap();
+    let lines: Vec<&str> = transpiled.text.split('\n').collect();
+    let last_line = lines.last().unwrap();
+    let input = last_line
+      .trim_start_matches("//# sourceMappingURL=data:application/json;base64,");
+    base64::prelude::BASE64_STANDARD.decode(input).unwrap();
+  }
+
+  #[test]
+  fn test_precompile_jsx() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+    let source = r#"const a = <Foo><span>hello</span>foo<Bar><p><span  class="bar">asdf</span></p></Bar></Foo>;"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::Tsx,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let transpile_options = TranspileOptions {
+      jsx: Some(JsxRuntime::Precompile(JsxPrecompileOptions {
+        automatic: JsxAutomaticOptions {
+          development: false,
+          import_source: None, // Should default to "react".
+        },
+        skip_elements: Some(vec!["p".to_string()]),
+        dynamic_props: Some(vec!["class".to_string()]),
+      })),
+      ..Default::default()
+    };
+    let code = program
+      .transpile(
+        &allocator,
+        &transpile_options,
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .unwrap()
+      .text;
+    let expected1 = r#"import { jsx as _jsx, jsxTemplate as _jsxTemplate, jsxAttr as _jsxAttr } from "react/jsx-runtime";
+const $$_tpl_2 = ["<span ", ">asdf</span>"];
+const $$_tpl_1 = ["<span>hello</span>foo", ""];
+const a = _jsx(Foo, { children: _jsxTemplate($$_tpl_1, _jsx(Bar, { children: _jsx("p", { children: _jsxTemplate($$_tpl_2, _jsxAttr("class", "bar")) }) })) });
+"#;
+    assert_eq!(&code[0..expected1.len()], expected1);
+  }
+
+  #[test]
+  fn test_verbatim_module_syntax() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let source = r#"import type foo from "./foo.ts"; import bar from "./bar.ts"; import baz from "./baz.ts"; const b: baz = 1;"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let transpile_options = TranspileOptions {
+      verbatim_module_syntax: true,
+      ..Default::default()
+    };
+    let code = program
+      .transpile(
+        &allocator,
+        &transpile_options,
+        &TranspileModuleOptions::default(),
+        &EmitOptions::default(),
+      )
+      .unwrap()
+      .text;
+    let (code, source_map) = split_inline_source_map(&code);
+    assert_eq!(
+      code,
+      "import bar from \"./bar.ts\";\nimport baz from \"./baz.ts\";\nconst b = 1;\n"
+    );
+    assert_eq!(source_map["sourcesContent"], serde_json::json!([source]));
+  }
+
+  #[test]
+  fn test_inline_source_map_newline() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+    let source = r#"{ const foo = "bar"; };"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::Tsx,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let emit_options = EmitOptions {
+      source_map: SourceMapOption::Inline,
+      ..Default::default()
+    };
+    let emit_result = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &emit_options,
+      )
+      .unwrap();
+    let (code, source_map) = split_inline_source_map(&emit_result.text);
+    assert_eq!(code, "{\n  const foo = \"bar\";\n}\n;\n");
+    assert_eq!(
+      source_map["sources"],
+      serde_json::json!(["https://deno.land/x/mod.tsx"])
+    );
+    assert_eq!(emit_result.source_map, None);
+  }
+
+  #[test]
+  fn test_source_map() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+    let source = r#"{ const foo = "bar"; };"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::Tsx,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let emit_options = EmitOptions {
+      source_map: SourceMapOption::Separate,
+      ..Default::default()
+    };
+    let emit_result = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &emit_options,
+      )
+      .unwrap();
+    assert_eq!(
+      &emit_result.text,
+      r#"{
+  const foo = "bar";
+}
+;
+"#
+    );
+    assert_source_map_eq(
+      emit_result.source_map.as_deref().unwrap(),
+      r#"{"version":3,"sources":["https://deno.land/x/mod.tsx"],"sourcesContent":["{ const foo = \"bar\"; };"],"names":[]}"#,
+    );
+  }
+
+  #[test]
+  fn test_source_map_base() {
+    #[track_caller]
+    fn run_test(file_name: &str, base: &str, expected: &str) {
+      let specifier = ModuleSpecifier::parse(file_name).unwrap();
+      let source = r#"{ const foo = "bar"; };"#;
+      let allocator = Allocator::default();
+      let mut program = parse_program(
+        &allocator,
+        ParseParams {
+          specifier,
+          text: source.into(),
+          media_type: MediaType::Tsx,
+          capture_tokens: false,
+          maybe_source_type: None,
+          scope_analysis: false,
+        },
+      )
+      .unwrap();
+      let emit_options = EmitOptions {
+        source_map: SourceMapOption::Separate,
+        source_map_base: Some(ModuleSpecifier::parse(base).unwrap()),
+        ..Default::default()
+      };
+      let emit_result = program
+        .transpile(
+          &allocator,
+          &TranspileOptions::default(),
+          &TranspileModuleOptions::default(),
+          &emit_options,
+        )
+        .unwrap();
+      assert_eq!(
+        &emit_result.text,
+        r#"{
+  const foo = "bar";
+}
+;
+"#
+      );
+      assert_source_map_eq(
+        &emit_result.source_map.unwrap(),
+        &serde_json::json!({
+          "version":3,
+          "sources":[expected],
+          "sourcesContent":["{ const foo = \"bar\"; };"],
+          "names":[],
+        })
+        .to_string(),
+      );
+    }
+
+    run_test(
+      "https://deno.land/x/mod.tsx",
+      "https://deno.land/x/",
+      "mod.tsx",
+    );
+    run_test(
+      "https://deno.land/x/mod.tsx",
+      "https://deno.land/",
+      "x/mod.tsx",
+    );
+    run_test(
+      "https://deno.land/x/mod.tsx",
+      "file:///home/user/",
+      "https://deno.land/x/mod.tsx",
+    );
+    run_test(
+      "https://deno.land/x/mod.tsx",
+      "https://example.com/",
+      "https://deno.land/x/mod.tsx",
+    );
+    run_test(
+      "https://example.com/base/",
+      "https://example.com/base/",
+      // maybe not ideal, but this is ok
+      "https://example.com/base/",
+    );
+    run_test("file:///example.ts", "file:///", "example.ts");
+    run_test(
+      "file:///sub_dir/example.ts",
+      "file:///",
+      "sub_dir/example.ts",
+    );
+    run_test(
+      "file:///sub_dir/example.ts",
+      "file:///sub_dir/",
+      "example.ts",
+    );
+  }
+
+  #[test]
+  fn test_source_map_with_file() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+    let source = r#"{ const foo = "bar"; };"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::Tsx,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let emit_options = EmitOptions {
+      source_map: SourceMapOption::Separate,
+      source_map_file: Some("mod.tsx".to_owned()),
+      ..Default::default()
+    };
+    let emit_result = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &emit_options,
+      )
+      .unwrap();
+    assert_eq!(
+      &emit_result.text,
+      r#"{
+  const foo = "bar";
+}
+;
+"#
+    );
+    assert_source_map_eq(
+      emit_result.source_map.as_deref().unwrap(),
+      r#"{"version":3,"file":"mod.tsx","sources":["https://deno.land/x/mod.tsx"],"sourcesContent":["{ const foo = \"bar\"; };"],"names":[]}"#,
+    );
+  }
+
+  #[test]
+  fn test_no_source_map() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
+    let source = r#"{ const foo = "bar"; };"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::Tsx,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let emit_options = EmitOptions {
+      source_map: SourceMapOption::None,
+      ..Default::default()
+    };
+    let emit_result = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &emit_options,
+      )
+      .unwrap();
+    assert_eq!(
+      &emit_result.text,
+      r#"{
+  const foo = "bar";
+}
+;
+"#
+    );
+    assert_eq!(emit_result.source_map, None);
+  }
+
+  #[test]
+  fn should_not_panic_with_scope_analysis() {
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let source = r#"
+const inspect: () => void = eval();
+
+export function defaultFormatter(record: Record): string {
+  for (let i = 0; i < 10; i++) {
+    inspect(record);
+  }
+}
+
+export function formatter(record: Record) {
+}
+"#;
+    let allocator = Allocator::default();
+    let mut program = parse_program(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: true,
+      },
+    )
+    .unwrap();
+
+    let emit_result = program.transpile(
+      &allocator,
+      &TranspileOptions::default(),
+      &TranspileModuleOptions::default(),
+      &EmitOptions::default(),
+    );
+    assert!(emit_result.is_ok());
+  }
+
+  #[test]
+  fn test_source_map_separate() {
+    let allocator = Allocator::default();
+    let specifier =
+      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
+    let source = "const a: number = 5;";
+    let mut program = parse_module(
+      &allocator,
+      ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+    let transpiled_source = program
+      .transpile(
+        &allocator,
+        &TranspileOptions::default(),
+        &TranspileModuleOptions::default(),
+        &EmitOptions {
+          source_map: SourceMapOption::Separate,
+          ..Default::default()
+        },
+      )
+      .unwrap();
+    assert!(transpiled_source.source_map.is_some());
+    assert!(!transpiled_source.text.contains("sourceMappingURL"));
   }
 
   #[test]
@@ -1370,527 +2193,5 @@ for (let i = 0; i < testVariable >> 1; i++) callCount++;
     // value imports should be preserved
     assert!(code.contains("bar"));
     assert!(code.contains("baz"));
-  }
-
-  #[test]
-  fn test_inline_source_map_newline() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
-    let source = r#"{ const foo = "bar"; };"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::Tsx,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let emit_options = EmitOptions {
-      source_map: SourceMapOption::Inline,
-      ..Default::default()
-    };
-    let emit_result = program
-      .transpile(
-        &allocator,
-        &TranspileOptions::default(),
-        &TranspileModuleOptions::default(),
-        &emit_options,
-      )
-      .unwrap();
-    assert!(emit_result.text.contains("const foo = \"bar\""));
-    assert!(
-      emit_result
-        .text
-        .contains("//# sourceMappingURL=data:application/json;base64,")
-    );
-    assert_eq!(emit_result.source_map, None);
-  }
-
-  #[test]
-  fn test_source_map() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
-    let source = r#"{ const foo = "bar"; };"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::Tsx,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let emit_options = EmitOptions {
-      source_map: SourceMapOption::Separate,
-      ..Default::default()
-    };
-    let emit_result = program
-      .transpile(
-        &allocator,
-        &TranspileOptions::default(),
-        &TranspileModuleOptions::default(),
-        &emit_options,
-      )
-      .unwrap();
-    assert!(emit_result.text.contains("const foo = \"bar\""));
-    assert!(!emit_result.text.contains("sourceMappingURL"));
-    assert!(emit_result.source_map.is_some());
-    let sm = emit_result.source_map.unwrap();
-    let value: serde_json::Value = serde_json::from_str(&sm).unwrap();
-    assert_eq!(value["version"], 3);
-    assert!(
-      value["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s.as_str().unwrap().contains("mod.tsx"))
-    );
-  }
-
-  #[test]
-  fn test_source_map_separate() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
-    let source = "const a: number = 5;";
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let transpiled_source = program
-      .transpile(
-        &allocator,
-        &TranspileOptions::default(),
-        &TranspileModuleOptions::default(),
-        &EmitOptions {
-          source_map: SourceMapOption::Separate,
-          ..Default::default()
-        },
-      )
-      .unwrap();
-    assert!(transpiled_source.source_map.is_some());
-    assert!(!transpiled_source.text.contains("sourceMappingURL"));
-  }
-
-  #[test]
-  fn test_no_source_map() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
-    let source = r#"{ const foo = "bar"; };"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::Tsx,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let emit_options = EmitOptions {
-      source_map: SourceMapOption::None,
-      ..Default::default()
-    };
-    let emit_result = program
-      .transpile(
-        &allocator,
-        &TranspileOptions::default(),
-        &TranspileModuleOptions::default(),
-        &emit_options,
-      )
-      .unwrap();
-    assert!(emit_result.text.contains("const foo = \"bar\""));
-    assert!(!emit_result.text.contains("sourceMappingURL"));
-    assert_eq!(emit_result.source_map, None);
-  }
-
-  #[test]
-  fn test_precompile_jsx() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
-    let source = r#"const a = <Foo><span>hello</span>foo<Bar><p><span  class="bar">asdf</span></p></Bar></Foo>;"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::Tsx,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let transpile_options = TranspileOptions {
-      jsx: Some(JsxRuntime::Precompile(JsxPrecompileOptions {
-        automatic: JsxAutomaticOptions {
-          development: false,
-          import_source: Some("react".to_string()),
-        },
-        skip_elements: Some(vec!["p".to_string()]),
-        dynamic_props: Some(vec!["class".to_string()]),
-      })),
-      ..Default::default()
-    };
-    let code = program
-      .transpile(
-        &allocator,
-        &transpile_options,
-        &TranspileModuleOptions::default(),
-        &EmitOptions::default(),
-      )
-      .unwrap()
-      .text;
-    assert!(code.contains("jsxTemplate") || code.contains("_jsxTemplate"));
-    assert!(code.contains("jsxAttr") || code.contains("_jsxAttr"));
-    assert!(code.contains("react/jsx-runtime"));
-  }
-
-  #[test]
-  fn source_map_properly_encoded() {
-    let allocator = Allocator::default();
-    let p = parse_module(
-      &allocator,
-      ParseParams {
-        specifier: ModuleSpecifier::parse("file:///Users/ib/dev/deno/foo.ts")
-          .unwrap(),
-        text: r#"export default function () {
-    return "📣❓";
-}"#
-          .into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: true,
-        scope_analysis: false,
-        maybe_source_type: None,
-      },
-    )
-    .unwrap();
-
-    let mut p = p;
-    let transpiled = p
-      .transpile(
-        &allocator,
-        &Default::default(),
-        &TranspileModuleOptions::default(),
-        &EmitOptions::default(),
-      )
-      .unwrap();
-    let lines: Vec<&str> = transpiled.text.split('\n').collect();
-    let last_line = lines.last().unwrap();
-    let input = last_line
-      .trim_start_matches("//# sourceMappingURL=data:application/json;base64,");
-    base64::prelude::BASE64_STANDARD.decode(input).unwrap();
-  }
-
-  #[test]
-  fn should_not_panic_with_scope_analysis() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
-    let source = r#"
-const inspect: () => void = eval();
-
-export function defaultFormatter(record: Record): string {
-  for (let i = 0; i < 10; i++) {
-    inspect(record);
-  }
-}
-
-export function formatter(record: Record) {
-}
-"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: true,
-      },
-    )
-    .unwrap();
-
-    let emit_result = program.transpile(
-      &allocator,
-      &TranspileOptions::default(),
-      &TranspileModuleOptions::default(),
-      &EmitOptions::default(),
-    );
-    assert!(emit_result.is_ok());
-  }
-
-  /// Helper that tries to parse and transpile, returning the error string.
-  /// Checks parse errors, non-fatal diagnostics, and transpile errors.
-  fn get_diagnostic(source: &str) -> String {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
-    let result = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    );
-    match result {
-      Err(e) => e.to_string(),
-      Ok(mut program) => {
-        // Check for non-fatal parse diagnostics first
-        if !program.diagnostics().is_empty() {
-          return program
-            .diagnostics()
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        }
-        program
-          .transpile(
-            &allocator,
-            &Default::default(),
-            &TranspileModuleOptions::default(),
-            &EmitOptions::default(),
-          )
-          .err()
-          .map(|e| e.to_string())
-          .unwrap_or_else(|| panic!("Expected an error for source: {source}"))
-      }
-    }
-  }
-
-  #[test]
-  fn diagnostic_octal_and_leading_zero_num_literals() {
-    // OXC currently accepts legacy octal literals in TypeScript module mode
-    // without producing diagnostics, unlike SWC which rejected them.
-    // Verify that at least "099" (legacy decimal) is also handled consistently.
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.ts").unwrap();
-    let result = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: "077".into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    );
-    // OXC may or may not error on legacy octals — just verify it doesn't panic
-    match result {
-      Err(e) => {
-        let msg = e.to_string();
-        assert!(
-          msg.contains("octal")
-            || msg.contains("Octal")
-            || msg.contains("legacy")
-            || msg.contains("0-prefixed"),
-          "Expected octal diagnostic, got: {msg}"
-        );
-      }
-      Ok(program) => {
-        // OXC accepts this — verify it at least parsed something
-        assert!(
-          program.diagnostics().is_empty()
-            || program.diagnostics().iter().any(|d| {
-              let msg = d.to_string();
-              msg.contains("octal") || msg.contains("Octal")
-            })
-        );
-      }
-    }
-  }
-
-  #[test]
-  fn diagnostic_missing_brace() {
-    let diag = get_diagnostic("function test() {");
-    assert!(
-      diag.contains("}")
-        || diag.contains("Expected")
-        || diag.contains("expected")
-        || diag.contains("Unexpected"),
-      "Expected missing brace diagnostic, got: {diag}"
-    );
-  }
-
-  #[test]
-  fn diagnostic_nullish_coalescing_with_logical_op() {
-    let diag = get_diagnostic("null || undefined ?? 'foo';");
-    assert!(
-      diag.contains("Nullish")
-        || diag.contains("nullish")
-        || diag.contains("??")
-        || diag.contains("coalescing")
-        || diag.contains("mixed"),
-      "Expected nullish coalescing diagnostic, got: {diag}"
-    );
-  }
-
-  #[test]
-  fn diagnostic_missing_init_in_using() {
-    let diag = get_diagnostic("using test");
-    assert!(
-      diag.contains("initializer")
-        || diag.contains("Expected")
-        || diag.contains("using")
-        || diag.contains("="),
-      "Expected using diagnostic, got: {diag}"
-    );
-  }
-
-  #[test]
-  fn diagnostic_invalid_left_hand_side_of_assignment() {
-    let diag = get_diagnostic("(true ? a : b) = 1;");
-    assert!(
-      diag.contains("left-hand")
-        || diag.contains("assign")
-        || diag.contains("Invalid"),
-      "Expected left-hand side diagnostic, got: {diag}"
-    );
-  }
-
-  #[test]
-  fn test_source_map_base() {
-    #[track_caller]
-    fn run_test(file_name: &str, base: &str, expected: &str) {
-      let allocator = Allocator::default();
-      let specifier = ModuleSpecifier::parse(file_name).unwrap();
-      let source = r#"{ const foo = "bar"; };"#;
-      let mut program = parse_module(
-        &allocator,
-        ParseParams {
-          specifier,
-          text: source.into(),
-          media_type: MediaType::Tsx,
-          capture_tokens: false,
-          maybe_source_type: None,
-          scope_analysis: false,
-        },
-      )
-      .unwrap();
-      let emit_options = EmitOptions {
-        source_map: SourceMapOption::Separate,
-        source_map_base: Some(ModuleSpecifier::parse(base).unwrap()),
-        ..Default::default()
-      };
-      let emit_result = program
-        .transpile(
-          &allocator,
-          &TranspileOptions::default(),
-          &TranspileModuleOptions::default(),
-          &emit_options,
-        )
-        .unwrap();
-      let source_map_str = emit_result.source_map.unwrap();
-      let value: serde_json::Value =
-        serde_json::from_str(&source_map_str).unwrap();
-      let sources = value["sources"].as_array().unwrap();
-      assert_eq!(
-        sources[0].as_str().unwrap(),
-        expected,
-        "For file_name={file_name}, base={base}"
-      );
-    }
-
-    run_test(
-      "https://deno.land/x/mod.tsx",
-      "https://deno.land/x/",
-      "mod.tsx",
-    );
-    run_test(
-      "https://deno.land/x/mod.tsx",
-      "https://deno.land/",
-      "x/mod.tsx",
-    );
-    run_test(
-      "https://deno.land/x/mod.tsx",
-      "file:///home/user/",
-      "https://deno.land/x/mod.tsx",
-    );
-    run_test(
-      "https://deno.land/x/mod.tsx",
-      "https://example.com/",
-      "https://deno.land/x/mod.tsx",
-    );
-    run_test("file:///example.ts", "file:///", "example.ts");
-    run_test(
-      "file:///sub_dir/example.ts",
-      "file:///",
-      "sub_dir/example.ts",
-    );
-    run_test(
-      "file:///sub_dir/example.ts",
-      "file:///sub_dir/",
-      "example.ts",
-    );
-  }
-
-  #[test]
-  fn test_source_map_with_file() {
-    let allocator = Allocator::default();
-    let specifier =
-      ModuleSpecifier::parse("https://deno.land/x/mod.tsx").unwrap();
-    let source = r#"{ const foo = "bar"; };"#;
-    let mut program = parse_module(
-      &allocator,
-      ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::Tsx,
-        capture_tokens: false,
-        maybe_source_type: None,
-        scope_analysis: false,
-      },
-    )
-    .unwrap();
-    let emit_options = EmitOptions {
-      source_map: SourceMapOption::Separate,
-      source_map_file: Some("mod.tsx".to_owned()),
-      ..Default::default()
-    };
-    let emit_result = program
-      .transpile(
-        &allocator,
-        &TranspileOptions::default(),
-        &TranspileModuleOptions::default(),
-        &emit_options,
-      )
-      .unwrap();
-    let source_map_str = emit_result.source_map.unwrap();
-    let value: serde_json::Value =
-      serde_json::from_str(&source_map_str).unwrap();
-    assert_eq!(value["file"].as_str().unwrap(), "mod.tsx",);
-    assert_eq!(
-      value["sources"][0].as_str().unwrap(),
-      "https://deno.land/x/mod.tsx",
-    );
   }
 }

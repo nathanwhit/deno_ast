@@ -2107,10 +2107,10 @@ const a = _jsxTemplate($$_tpl_1);"#,
     test_transform(
       &allocator,
       JsxPrecompile::new(&allocator, None, None, None),
-      r#"const a = <div>"a&</div>;"#,
+      r#"const a = <div>"a&'</div>;"#,
       r#"import { jsxTemplate as _jsxTemplate } from "react/jsx-runtime";
 const $$_tpl_1 = [
-	"<div>&quot;a&amp;</div>"
+	"<div>&quot;a&amp;&#39;</div>"
 ];
 const a = _jsxTemplate($$_tpl_1);"#,
     );

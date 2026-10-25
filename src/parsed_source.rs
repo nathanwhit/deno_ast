@@ -221,24 +221,23 @@ impl<'a> ParsedSource<'a> {
   }
 }
 
-/// Checks if a module body should be treated as a script by looking
-/// for TypeScript-specific CJS patterns like `import x = require()`.
-fn compute_is_script_from_body(body: &[Statement<'_>]) -> bool {
+/// A TypeScript module without any ES module syntax (imports/exports) is
+/// treated as a script. TypeScript-specific CommonJS syntax like
+/// `import x = require()` and `export = x` keeps it a script.
+pub(crate) fn compute_is_script_from_body(body: &[Statement<'_>]) -> bool {
   use oxc::ast::ast::*;
-  for stmt in body {
-    match stmt {
-      Statement::ImportDeclaration(_)
-      | Statement::ExportDeclaration(_)
-      | Statement::ExportNamedDeclaration(_)
-      | Statement::ExportFromDeclaration(_)
-      | Statement::ExportDefaultDeclaration(_)
-      | Statement::ExportAllDeclaration(_) => return false,
-      Statement::TSImportEqualsDeclaration(_)
-      | Statement::TSExportAssignment(_) => return true,
-      _ => {}
+  !body.iter().any(|stmt| match stmt {
+    Statement::ImportDeclaration(_)
+    | Statement::ExportNamedDeclaration(_)
+    | Statement::ExportFromDeclaration(_)
+    | Statement::ExportDefaultDeclaration(_)
+    | Statement::ExportAllDeclaration(_) => true,
+    // `export import x = ...` is CommonJS syntax
+    Statement::ExportDeclaration(decl) => {
+      !matches!(decl.declaration, Declaration::TSImportEqualsDeclaration(_))
     }
-  }
-  false
+    _ => false,
+  })
 }
 
 impl fmt::Debug for ParsedSource<'_> {
@@ -247,5 +246,53 @@ impl fmt::Debug for ParsedSource<'_> {
       .field("specifier", &self.specifier)
       .field("media_type", &self.media_type)
       .finish()
+  }
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+  use crate::ParseParams;
+  use crate::parse_program;
+  use oxc::allocator::Allocator;
+
+  #[test]
+  fn compute_is_script() {
+    fn get(text: &str, ext: &str) -> bool {
+      let specifier =
+        ModuleSpecifier::parse(&format!("file:///my_file.{}", ext)).unwrap();
+      let media_type = MediaType::from_specifier(&specifier);
+      let allocator = Allocator::default();
+      let program = parse_program(
+        &allocator,
+        ParseParams {
+          specifier,
+          text: text.into(),
+          media_type,
+          capture_tokens: true,
+          maybe_source_type: None,
+          scope_analysis: false,
+        },
+      )
+      .unwrap();
+      program.compute_is_script()
+    }
+
+    // false, tla
+    assert!(!get(
+      "const mod = await import('./soljson.js');\nconsole.log(mod)",
+      "js"
+    ));
+
+    // false, import
+    assert!(!get("import './test';", "js"));
+    assert!(!get("import './test';", "ts"));
+
+    // true, require
+    assert!(get("require('test')", "js"));
+    assert!(get("require('test')", "ts"));
+
+    // true, ts import equals
+    assert!(get("import value = require('test');", "ts"));
   }
 }

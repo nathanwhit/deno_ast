@@ -114,6 +114,7 @@ impl ParseDiagnostic {
       .first()
       .map(|label| Span::new(label.offset(), label.offset() + label.len()))
       .unwrap_or(Span::new(0, 0));
+    let span = adjust_empty_span_at_trailing_whitespace(span, &source);
 
     ParseDiagnostic(Box::new(ParseDiagnosticInner {
       specifier: specifier.clone(),
@@ -138,6 +139,31 @@ impl ParseDiagnostic {
       source,
     }))
   }
+}
+
+/// The parser reports errors like an unexpected end of file with an empty span
+/// after any trailing whitespace. Point those at the end of the preceding code
+/// instead so the diagnostic shows that code rather than a blank line.
+fn adjust_empty_span_at_trailing_whitespace(
+  span: Span,
+  source: &SourceTextInfo,
+) -> Span {
+  if span.start != span.end {
+    return span;
+  }
+  let text = source.text_str();
+  let Some(preceding) = text.get(..span.start as usize) else {
+    return span;
+  };
+  let trimmed_len = preceding.trim_end().len();
+  if trimmed_len == preceding.len() || trimmed_len == 0 {
+    return span;
+  }
+  // the span moved across a line, so point at the end of the code
+  if source.line_index(trimmed_len) == source.line_index(span.start as usize) {
+    return span;
+  }
+  Span::new(trimmed_len as u32, trimmed_len as u32)
 }
 
 impl Diagnostic for ParseDiagnostic {
