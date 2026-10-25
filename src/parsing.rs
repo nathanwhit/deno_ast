@@ -573,6 +573,40 @@ mod test {
   }
 
   #[test]
+  fn should_parse_brand_checks_in_js() {
+    use oxc::ast::ast::ClassElement;
+    use oxc::ast::ast::Statement;
+    use oxc::span::GetSpan;
+
+    let allocator = Allocator::default();
+    let program = parse_module(
+      &allocator,
+      ParseParams {
+        specifier: ModuleSpecifier::parse("file:///my_file.js").unwrap(),
+        text: "class T { method() { #test in this; } }".into(),
+        media_type: MediaType::JavaScript,
+        capture_tokens: true,
+        maybe_source_type: None,
+        scope_analysis: false,
+      },
+    )
+    .unwrap();
+
+    let Statement::ClassDeclaration(class_decl) = &program.body()[0] else {
+      panic!("expected a class declaration");
+    };
+    let ClassElement::MethodDefinition(method) = &class_decl.body.body[0]
+    else {
+      panic!("expected a method");
+    };
+    let method_stmt = &method.value.body.as_ref().unwrap().statements[0];
+    assert_eq!(
+      method_stmt.span().source_text(program.text()),
+      "#test in this;"
+    );
+  }
+
+  #[test]
   fn test_err_trailing_blank_line() {
     let diagnostic = parse_ts_module("setTimeout(() => {}),\n").err().unwrap();
     assert_eq!(
