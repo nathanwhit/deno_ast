@@ -50,18 +50,18 @@ used:
     - If no, it's a patch release.
   - If no, it's a minor release.
 
-## swc upgrades
+## oxc upgrades
 
-We upgrade swc about once a month. Upgrading swc is a very involved process that
-often requires many changes in downstream Deno crates. We also test the new
-version of swc in all downstream crates before merging a PR into deno_ast that
-updates swc.
+We upgrade [oxc](https://github.com/oxc-project/oxc) regularly. oxc releases
+often contain AST changes that require updates in downstream Deno crates, so we
+test the new version of oxc in all downstream crates before merging a PR into
+deno_ast that updates oxc.
 
-**Please do not open a PR for upgrading swc** unless you have stated you are
+**Please do not open a PR for upgrading oxc** unless you have stated you are
 going to work on it in the issue tracker and have run the tests on all
 downstream crates.
 
-To upgrade swc:
+To upgrade oxc:
 
 1. Checkout the following repositories in sibling directories to this repository
    (ex. `/home/david/dev/deno_graph`, `/home/david/dev/deno_ast`):
@@ -74,7 +74,7 @@ To upgrade swc:
 1. Ensure they all have `upstream` remotes set for the urls specified above. For
    example, your `deno_graph` repo should have
    `git remote add upstream https://github.com/denoland/deno_graph`.
-1. Run `./scripts/update_swc_deps.ts`
+1. Run `./scripts/update_oxc_deps.ts`
 1. Run `./scripts/01_setup.ts`
 1. Run `./scripts/02_build.ts` and fix any build errors.
 1. Run `./scripts/03_test.ts` and fix any failing tests.

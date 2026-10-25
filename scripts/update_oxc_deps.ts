@@ -12,18 +12,17 @@ const repo = await Repo.load({
 });
 
 const crate = repo.getCrate("deno_ast");
-const swcDeps = crate.dependencies.filter(
-  (dep) => dep.name.startsWith("swc_") || dep.name === "dprint-swc-ext",
+const oxcDeps = crate.dependencies.filter(
+  (dep) => dep.name === "oxc" || dep.name.startsWith("oxc_"),
 );
-for (const dep of swcDeps) {
+for (const dep of oxcDeps) {
   const version = await Crate.getLatestVersion(dep.name);
   if (version == null) {
     throw new Error(`Could not find latest version for ${dep.name}`);
   }
 
-  const newReq = dep.name === "dprint-swc-ext" ? "^" + version : "=" + version;
-  if (newReq !== dep.req) {
-    $.logStep("Updating", dep.name, "from", dep.req, "to", newReq);
-    crate.setDependencyVersion(dep.name, newReq.replace(/^\^/, ""));
+  if (version !== dep.req) {
+    $.logStep("Updating", dep.name, "from", dep.req, "to", version);
+    crate.setDependencyVersion(dep.name, version);
   }
 }
